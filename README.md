@@ -65,18 +65,18 @@
 
 ```mermaid
 flowchart LR
-    ENV[Environment<br/>需求文档 / 历史测试用例 / 人工审核反馈]
+    ENV["Environment<br/>需求文档 / 历史测试用例 / 人工审核反馈"]
 
     subgraph SYS["AI Test Case Generator"]
         direction TB
 
-        P[Perception<br/>文档解析 / 状态读取 / 审核输入]
-        PLAN[Planning<br/>LangGraph Workflow]
-        CORE[The "Augmented" LLM<br/>需求分析 / 测试点 / 大纲 / 用例生成]
-        A[Action<br/>阶段推进 / 结果输出 / Excel 导出]
+        P["Perception<br/>文档解析 / 状态读取 / 审核输入"]
+        PLAN["Planning<br/>LangGraph Workflow"]
+        CORE["Augmented LLM<br/>需求分析 / 测试点 / 大纲 / 用例生成"]
+        A["Action<br/>阶段推进 / 结果输出 / Excel 导出"]
 
-        TOOLS[Tools<br/>Query 扩展 / 向量召回 / BM25 / RRF / Rerank]
-        MEM[Memory<br/>Chroma 向量库 / 历史用例知识库]
+        TOOLS["Tools<br/>Query 扩展 / 向量召回 / BM25 / RRF / Rerank"]
+        MEM["Memory<br/>Chroma 向量库 / 历史用例知识库"]
 
         P --> CORE
         PLAN --> CORE
