@@ -161,8 +161,6 @@ ai-test-case-generator/
 - Python 3.10+
 - Windows / macOS / Linux 都可以
 
-当前你的环境里已经用的是 Python 3.12，所以 Python 3.12 是可以跑的。
-
 ### 5.2 模型 API
 
 你至少需要一个 OpenAI 兼容接口：
