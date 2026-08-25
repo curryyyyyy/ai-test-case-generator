@@ -12,6 +12,12 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# 在导入期就加载 .env，确保任何缓存资源构建前配置已就绪。
+# 若把 load_dotenv 放在 @st.cache_resource 函数内，缓存只执行一次，
+# 进程启动后修改 .env 将无法重新加载，必须重启进程。
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
+
 WORKFLOW_DIR = PROJECT_ROOT / "workflow"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
@@ -62,9 +68,6 @@ def _default_state() -> dict[str, Any]:
 
 @st.cache_resource
 def get_graph_and_llm() -> tuple[Any, ChatOpenAI]:
-    env_path = PROJECT_ROOT / ".env"
-    load_dotenv(dotenv_path=env_path)
-
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("未检测到 OPENAI_API_KEY，请先在项目根目录 .env 配置。")
@@ -93,7 +96,8 @@ def _ensure_session() -> None:
     if "source_doc_id" not in st.session_state:
         st.session_state.source_doc_id = ""
     if "requirement_editor_text" not in st.session_state:
-        st.session_state.requirement_editor_text = ""
+        # Use a sentinel so an empty user edit isn't mistaken for "uninitialized".
+        st.session_state.requirement_editor_text = None
     if "test_points_table" not in st.session_state:
         st.session_state.test_points_table = []
     if "outline_table" not in st.session_state:
@@ -268,7 +272,7 @@ def _reset_flow() -> None:
     st.session_state.source_structured_doc = {}
     st.session_state.source_file_name = ""
     st.session_state.source_doc_id = ""
-    st.session_state.requirement_editor_text = ""
+    st.session_state.requirement_editor_text = None
     st.session_state.test_points_table = []
     st.session_state.outline_table = []
     st.session_state.test_cases_table = []
@@ -319,6 +323,19 @@ def _prime_editors_from_values(values: dict[str, Any], phase: str) -> None:
         st.session_state.test_cases_table = _cases_to_table_rows(values.get("test_cases", []))
 
 
+def _phase_artifact_ready(values: dict[str, Any], phase: str) -> bool:
+    """判断工作流是否已生成目标阶段的产出物。"""
+    if phase == PHASE_REQUIREMENT:
+        return bool(values.get("requirement_analysis"))
+    if phase == PHASE_TEST_POINTS:
+        return bool(values.get("test_points"))
+    if phase == PHASE_OUTLINE:
+        return bool(values.get("test_outline"))
+    if phase == PHASE_CASE:
+        return bool(values.get("test_cases"))
+    return False
+
+
 def _replay_to_phase(graph: Any, llm: ChatOpenAI, target_phase: str) -> None:
     if not st.session_state.source_structured_doc:
         raise ValueError("缺少已上传文档，请先上传并开始生成。")
@@ -345,9 +362,22 @@ def _replay_to_phase(graph: Any, llm: ChatOpenAI, target_phase: str) -> None:
     init_state["structured_doc"] = st.session_state.source_structured_doc
     init_state["doc_id"] = st.session_state.source_doc_id
 
+    # 工作流编译时除首个节点外均设置了 interrupt_before。
+    # 这意味着每次 graph.invoke 只执行到被打断节点之前（不含该节点）并在中断边界返回。
+    # 要到达目标阶段，必须持续用 invoke(None, config) 恢复；每次恢复会执行被中断的节点
+    # 并推进到下一个边界。最多 invoke invoke_count 次，一旦目标产出物就绪即提前结束。
+    target_ready = False
     for index in range(invoke_count):
         payload = init_state if index == 0 else None
         _run_with_progress(labels[index], lambda p=payload: graph.invoke(p, config))
+        values = _get_state_values(graph, config)
+        if _phase_artifact_ready(values, target_phase):
+            target_ready = True
+            break
+
+    if not target_ready:
+        # 兜底：若最后一个节点处于中断状态，再恢复一次确保执行。
+        _run_with_progress(labels[-1], lambda: graph.invoke(None, config))
 
     values = _get_state_values(graph, config)
     _prime_editors_from_values(values, target_phase)
@@ -356,12 +386,22 @@ def _replay_to_phase(graph: Any, llm: ChatOpenAI, target_phase: str) -> None:
 
 def _rerun_current_phase(graph: Any, llm: ChatOpenAI, phase: str) -> None:
     """Re-run generation for current phase based on existing checkpoint state."""
-    from nodes import (
-        analyze_requirement_node,
-        extract_test_points_node,
-        generate_cases_node,
-        generate_outline_node,
-    )
+    # workflow 目录在运行时已加入 sys.path，因此可直接导入 nodes 模块。
+    # 先用静态可解析的方式导入（供类型检查/IDE 识别），失败再退回 sys.path 方式。
+    try:  # pragma: no cover - 静态解析兜底
+        from workflow.nodes import (  # type: ignore
+            analyze_requirement_node,
+            extract_test_points_node,
+            generate_cases_node,
+            generate_outline_node,
+        )
+    except ImportError:
+        from nodes import (  # type: ignore
+            analyze_requirement_node,
+            extract_test_points_node,
+            generate_cases_node,
+            generate_outline_node,
+        )
 
     config = _build_config(llm)
     values = _get_state_values(graph, config)
@@ -562,7 +602,7 @@ def _render_requirement_page(graph: Any, llm: ChatOpenAI) -> None:
     values = _get_state_values(graph, config)
     requirement_analysis = str(values.get("requirement_analysis", ""))
 
-    if not st.session_state.requirement_editor_text:
+    if st.session_state.requirement_editor_text is None:
         st.session_state.requirement_editor_text = requirement_analysis
 
     st.caption("AI 生成需求分析")
