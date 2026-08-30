@@ -29,6 +29,31 @@ from skills.test_design_skills import (  # noqa: E402
 )
 
 
+# 检索日志保留上限。日志会随每次“重新生成”线性增长并全部进入 checkpoint，
+# 不设上限会让 state 膨胀到拖垮内存与序列化开销。
+RETRIEVAL_LOG_MAX_ENTRIES = 10
+# 只保留前 N 条命中的全文。前端“查看全文”也只展示前 3 条，
+# 其余仅留预览即可，可显著降低单条日志体积。
+RETRIEVAL_LOG_FULL_TEXT_HITS = 3
+
+
+def _build_log_hits(chunks: list[Any]) -> list[dict[str, Any]]:
+    hits: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks):
+        hits.append(
+            {
+                "chunk_id": chunk.chunk_id,
+                "doc_type": getattr(chunk, "doc_type", ""),
+                "section_path": chunk.section_path,
+                "source_name": chunk.source_name,
+                "score": chunk.score,
+                "text_preview": chunk.text[:300],
+                "text_full": chunk.text if index < RETRIEVAL_LOG_FULL_TEXT_HITS else "",
+            }
+        )
+    return hits
+
+
 def _append_retrieval_log(
     state: TestCaseState,
     phase: str,
@@ -54,18 +79,7 @@ def _append_retrieval_log(
             "top_k": len(chunks),
             "pre_dedup_count": pre_dedup_count,
             "post_dedup_count": post_dedup_count,
-            "hits": [
-                {
-                    "chunk_id": chunk.chunk_id,
-                    "doc_type": getattr(chunk, "doc_type", ""),
-                    "section_path": chunk.section_path,
-                    "source_name": chunk.source_name,
-                    "score": chunk.score,
-                    "text_preview": chunk.text[:300],
-                    "text_full": chunk.text,
-                }
-                for chunk in chunks
-            ],
+            "hits": _build_log_hits(chunks),
             "citations": citations,
             "latency_ms": latency_ms,
             "rerank_mode": rerank_mode,
@@ -75,7 +89,8 @@ def _append_retrieval_log(
             "rerank_degraded_reason": rerank_degraded_reason,
         }
     )
-    return logs
+    # 只保留最近的若干条，避免日志无界增长。
+    return logs[-RETRIEVAL_LOG_MAX_ENTRIES:]
 
 
 def _truncate_for_query(text: str, limit: int = 600) -> str:

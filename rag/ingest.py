@@ -8,6 +8,7 @@ from typing import Any
 from langchain_core.documents import Document
 
 from rag.config import CHUNK_OVERLAP, CHUNK_SIZE
+from rag.retriever import invalidate_bm25_cache
 from rag.schemas import Chunk
 from rag.store import get_vector_store
 from utils.document_parser.docx_parser import parse_docx
@@ -188,6 +189,9 @@ def index_document(
     vector_store = get_vector_store()
     ids, docs = _build_documents(chunk_list)
     vector_store.add_documents(documents=docs, ids=ids)
+
+    # 语料已变化，必须让 BM25 索引失效，否则会命中过期索引导致漏召回。
+    invalidate_bm25_cache()
 
     return len(ids)
 

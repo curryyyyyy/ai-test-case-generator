@@ -45,3 +45,5 @@ Thumbs.db
 # Project runtime data
 data/
 output/
+streamlit_stdout.log
+.gitignore

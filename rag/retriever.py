@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import math
 import re
+import threading
+import time
 from typing import Any
 
 from rag.config import (
@@ -117,8 +120,158 @@ def _vector_search_once(
     return results
 
 
+# 连续汉字片段 / 其他词片段（汉字优先，以便单独按 bigram 处理）
+_CJK_OR_WORD_RE = re.compile(r"[\u4e00-\u9fff]+|\w+")
+_CJK_ONLY_RE = re.compile(r"[\u4e00-\u9fff]+")
+
+
 def _tokenize_for_bm25(text: str) -> list[str]:
-    return re.findall(r"\w+|[\u4e00-\u9fff]", text.lower())
+    """BM25 分词：非中文按词切分，连续中文按相邻二字组（bigram）切分。
+
+    原实现用 `\\w+|[\\u4e00-\\u9fff]`，由于 `\\w` 本身匹配汉字，连续无空格的中文
+    会被整体吞成一个超长 token，例如“登录支持短信验证码登录方式”整体作为一个词，
+    导致查询词“短信”永远无法命中——BM25 对中文事实上失效，混合检索里的
+    BM25 分支等于空转。这里改为对中文生成 bigram，使子串查询可以命中。
+    """
+    tokens: list[str] = []
+    for segment in _CJK_OR_WORD_RE.findall(text.lower()):
+        if _CJK_ONLY_RE.fullmatch(segment):
+            if len(segment) == 1:
+                tokens.append(segment)
+            else:
+                tokens.extend(segment[i : i + 2] for i in range(len(segment) - 1))
+        else:
+            tokens.append(segment)
+    return tokens
+
+
+BM25_K1 = 1.5
+BM25_B = 0.75
+# BM25 索引缓存有效期（秒）。语料发生写入时会由 ingest 主动失效，
+# TTL 只作为兜底，防止极端情况下长期命中过期索引。
+BM25_CACHE_TTL_SECONDS = 300.0
+
+
+@dataclass
+class _BM25Document:
+    """供 _build_chunk 消费的轻量文档对象。"""
+
+    page_content: str
+    metadata: dict[str, Any]
+
+
+@dataclass
+class _BM25Index:
+    documents: list[str]
+    metadatas: list[dict[str, Any]]
+    doc_lengths: list[int]
+    avg_doc_len: float
+    # 倒排索引：term -> [(doc_index, term_freq)]
+    postings: dict[str, list[tuple[int, int]]]
+    doc_freq: dict[str, int]
+    created_at: float
+
+
+# 缓存键为过滤条件，不同 doc_id / doc_type / 额外过滤各自持有独立索引。
+_BM25_CACHE: dict[str, _BM25Index] = {}
+_BM25_CACHE_LOCK = threading.Lock()
+
+
+def invalidate_bm25_cache() -> None:
+    """语料写入后调用，避免检索命中过期索引。"""
+    with _BM25_CACHE_LOCK:
+        _BM25_CACHE.clear()
+
+
+def _build_bm25_index(
+    documents: list[str],
+    metadatas: list[dict[str, Any]],
+) -> _BM25Index | None:
+    tokenized_docs = [_tokenize_for_bm25(str(text)) for text in documents]
+    doc_lengths = [len(tokens) for tokens in tokenized_docs]
+    doc_count = len(doc_lengths)
+    if doc_count == 0:
+        return None
+
+    total_len = sum(doc_lengths)
+    if total_len <= 0:
+        return None
+
+    postings: dict[str, list[tuple[int, int]]] = {}
+    for doc_index, tokens in enumerate(tokenized_docs):
+        term_freq: dict[str, int] = {}
+        for token in tokens:
+            term_freq[token] = term_freq.get(token, 0) + 1
+        for token, freq in term_freq.items():
+            postings.setdefault(token, []).append((doc_index, freq))
+
+    return _BM25Index(
+        documents=list(documents),
+        metadatas=list(metadatas),
+        doc_lengths=doc_lengths,
+        avg_doc_len=total_len / doc_count,
+        postings=postings,
+        doc_freq={term: len(items) for term, items in postings.items()},
+        created_at=time.time(),
+    )
+
+
+def _get_bm25_index(where_filter: dict[str, Any]) -> _BM25Index | None:
+    """获取（必要时构建）BM25 索引。
+
+    原实现每次查询都全量拉语料并重新分词，一次完整流水线会触发约 30 次
+    全库扫描；这里改为复用缓存索引，仅对命中的倒排表打分。
+    """
+    cache_key = json.dumps(where_filter, sort_keys=True, default=str)
+    now = time.time()
+
+    with _BM25_CACHE_LOCK:
+        cached = _BM25_CACHE.get(cache_key)
+        if cached is not None and now - cached.created_at < BM25_CACHE_TTL_SECONDS:
+            return cached
+
+    # 构建索引是重活，刻意不持锁，避免阻塞并发查询。
+    vector_store = get_vector_store()
+    payload = vector_store.get(
+        where=where_filter,
+        include=["documents", "metadatas"],
+    )
+    documents = payload.get("documents", []) or []
+    metadatas = payload.get("metadatas", []) or []
+    if not documents or not metadatas:
+        with _BM25_CACHE_LOCK:
+            _BM25_CACHE.pop(cache_key, None)
+        return None
+
+    index = _build_bm25_index(documents, metadatas)
+    with _BM25_CACHE_LOCK:
+        if index is None:
+            _BM25_CACHE.pop(cache_key, None)
+        else:
+            _BM25_CACHE[cache_key] = index
+    return index
+
+
+def _score_bm25_index(
+    index: _BM25Index,
+    query_terms: list[str],
+) -> dict[int, float]:
+    doc_count = len(index.doc_lengths)
+    scores: dict[int, float] = {}
+    for term in query_terms:
+        items = index.postings.get(term)
+        if not items:
+            continue
+        df = index.doc_freq.get(term, 0)
+        idf = math.log(1 + (doc_count - df + 0.5) / (df + 0.5))
+        for doc_index, freq in items:
+            doc_len = index.doc_lengths[doc_index]
+            numerator = freq * (BM25_K1 + 1)
+            denominator = freq + BM25_K1 * (
+                1 - BM25_B + BM25_B * doc_len / index.avg_doc_len
+            )
+            scores[doc_index] = scores.get(doc_index, 0.0) + idf * numerator / denominator
+    return scores
 
 
 def _bm25_search_once(
@@ -128,81 +281,32 @@ def _bm25_search_once(
     k: int,
     extra_filter: dict[str, str] | None = None,
 ) -> list[RetrievedChunk]:
-    vector_store = get_vector_store()
+    query_terms = _tokenize_for_bm25(query_text)
+    if not query_terms:
+        return []
+
     where_filter = _build_where_filter(
         doc_id=doc_id,
         doc_type=doc_type,
         extra_filter=extra_filter,
     )
-    payload = vector_store.get(
-        where=where_filter,
-        include=["documents", "metadatas"],
-    )
-    documents = payload.get("documents", []) or []
-    metadatas = payload.get("metadatas", []) or []
-    if not documents or not metadatas:
+    index = _get_bm25_index(where_filter)
+    if index is None:
         return []
 
-    query_terms = _tokenize_for_bm25(query_text)
-    if not query_terms:
-        return []
+    scores = _score_bm25_index(index, query_terms)
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
 
-    tokenized_docs: list[list[str]] = []
-    term_doc_freq: dict[str, int] = {}
-    doc_lengths: list[int] = []
-    for text in documents:
-        tokens = _tokenize_for_bm25(str(text))
-        tokenized_docs.append(tokens)
-        doc_lengths.append(len(tokens))
-        seen: set[str] = set()
-        for token in tokens:
-            if token not in seen:
-                term_doc_freq[token] = term_doc_freq.get(token, 0) + 1
-                seen.add(token)
-
-    doc_count = len(tokenized_docs)
-    if doc_count == 0:
-        return []
-    avg_doc_len = sum(doc_lengths) / doc_count if doc_lengths else 0.0
-    if avg_doc_len <= 0:
-        return []
-
-    k1 = 1.5
-    b = 0.75
-    scored: list[RetrievedChunk] = []
-    for text, metadata, tokens, doc_len in zip(documents, metadatas, tokenized_docs, doc_lengths):
-        if not tokens:
-            continue
-        tf: dict[str, int] = {}
-        for token in tokens:
-            tf[token] = tf.get(token, 0) + 1
-
-        score = 0.0
-        for term in query_terms:
-            freq = tf.get(term, 0)
-            if freq <= 0:
-                continue
-            df = term_doc_freq.get(term, 0)
-            idf = math.log(1 + (doc_count - df + 0.5) / (df + 0.5))
-            numerator = freq * (k1 + 1)
-            denominator = freq + k1 * (1 - b + b * doc_len / avg_doc_len)
-            score += idf * numerator / denominator
-
+    results: list[RetrievedChunk] = []
+    for doc_index, score in ranked[:k]:
         if score <= 0:
             continue
-
-        doc = type(
-            "BM25Document",
-            (),
-            {
-                "page_content": str(text),
-                "metadata": metadata or {},
-            },
-        )()
-        scored.append(_build_chunk(doc, score, query_text, doc_id, doc_type))
-
-    scored.sort(key=lambda item: item.score, reverse=True)
-    return scored[:k]
+        doc = _BM25Document(
+            page_content=str(index.documents[doc_index]),
+            metadata=index.metadatas[doc_index] or {},
+        )
+        results.append(_build_chunk(doc, score, query_text, doc_id, doc_type))
+    return results
 
 
 def _fuse_ranked_results(

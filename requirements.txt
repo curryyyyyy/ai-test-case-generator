@@ -5,6 +5,7 @@ langchain-community
 langchain-core
 langchain-openai
 langgraph
+langgraph-checkpoint-sqlite
 chromadb
 pydantic
 openpyxl
