@@ -31,6 +31,7 @@ from rag.query_expander import expand_query
 from rag.reranker import rerank
 from rag.schemas import Citation, RetrievedChunk
 from rag.store import get_vector_store
+from rag.text_utils import tokenize
 
 
 @dataclass
@@ -120,29 +121,9 @@ def _vector_search_once(
     return results
 
 
-# 连续汉字片段 / 其他词片段（汉字优先，以便单独按 bigram 处理）
-_CJK_OR_WORD_RE = re.compile(r"[\u4e00-\u9fff]+|\w+")
-_CJK_ONLY_RE = re.compile(r"[\u4e00-\u9fff]+")
-
-
-def _tokenize_for_bm25(text: str) -> list[str]:
-    """BM25 分词：非中文按词切分，连续中文按相邻二字组（bigram）切分。
-
-    原实现用 `\\w+|[\\u4e00-\\u9fff]`，由于 `\\w` 本身匹配汉字，连续无空格的中文
-    会被整体吞成一个超长 token，例如“登录支持短信验证码登录方式”整体作为一个词，
-    导致查询词“短信”永远无法命中——BM25 对中文事实上失效，混合检索里的
-    BM25 分支等于空转。这里改为对中文生成 bigram，使子串查询可以命中。
-    """
-    tokens: list[str] = []
-    for segment in _CJK_OR_WORD_RE.findall(text.lower()):
-        if _CJK_ONLY_RE.fullmatch(segment):
-            if len(segment) == 1:
-                tokens.append(segment)
-            else:
-                tokens.extend(segment[i : i + 2] for i in range(len(segment) - 1))
-        else:
-            tokens.append(segment)
-    return tokens
+# 分词统一收敛到 rag.text_utils，BM25 与 Rerank 共用同一实现，
+# 避免两处逻辑漂移（此前正是两份相同实现带着同一个中文缺陷）。
+_tokenize_for_bm25 = tokenize
 
 
 BM25_K1 = 1.5

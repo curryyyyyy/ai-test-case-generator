@@ -30,6 +30,7 @@ from utils.document_parser.md_parser import parse_markdown
 from rag.ingest import index_document
 from rag.ingest import index_testcase_knowledge_file
 from rag.store import is_embedding_degraded
+from workflow.checkpoint_store import new_thread_id
 from workflow.workflow import create_workflow
 
 
@@ -97,7 +98,7 @@ def _ensure_session() -> None:
     if "phase" not in st.session_state:
         st.session_state.phase = PHASE_UPLOAD
     if "thread_id" not in st.session_state:
-        st.session_state.thread_id = f"web_{uuid.uuid4().hex}"
+        st.session_state.thread_id = new_thread_id()
     if "source_document" not in st.session_state:
         st.session_state.source_document = ""
     if "source_structured_doc" not in st.session_state:
@@ -278,7 +279,7 @@ def _normalize_cases(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _reset_flow() -> None:
     st.session_state.phase = PHASE_UPLOAD
-    st.session_state.thread_id = f"web_{uuid.uuid4().hex}"
+    st.session_state.thread_id = new_thread_id()
     st.session_state.source_document = ""
     st.session_state.source_structured_doc = {}
     st.session_state.source_file_name = ""
@@ -381,7 +382,7 @@ def _replay_to_phase(graph: Any, llm: ChatOpenAI, target_phase: str) -> None:
     ]
 
     invoke_count = invoke_count_map[target_phase]
-    st.session_state.thread_id = f"web_{uuid.uuid4().hex}"
+    st.session_state.thread_id = new_thread_id()
     config = _build_config(llm)
 
     init_state = _default_state()

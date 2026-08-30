@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-import re
 import time
 from typing import Any
+
+from rag.text_utils import tokenize_unique
 
 
 @dataclass
@@ -17,14 +18,11 @@ class RerankResult:
     degraded_reason: str
 
 
-def _tokenize(text: str) -> set[str]:
-    tokens = re.findall(r"\w+|[\u4e00-\u9fff]", text.lower())
-    return set(token for token in tokens if token.strip())
-
-
 def _score(query: str, text: str, base_score: float) -> float:
-    q = _tokenize(query)
-    t = _tokenize(text)
+    # 复用检索侧的统一分词器（含中文 bigram 修复），
+    # 否则重排的重合度打分对中文恒为 0，lite 重排等于失效。
+    q = tokenize_unique(query)
+    t = tokenize_unique(text)
     if not q or not t:
         return base_score
     overlap = len(q.intersection(t))
