@@ -28,6 +28,7 @@ from utils.document_parser.docx_parser import parse_docx
 from utils.document_parser.md_parser import parse_markdown
 from rag.ingest import index_document
 from rag.ingest import index_testcase_knowledge_file
+from rag.store import is_embedding_degraded
 from workflow import create_workflow
 
 
@@ -37,6 +38,12 @@ PHASE_TEST_POINTS = "test_points_review"
 PHASE_OUTLINE = "outline_review"
 PHASE_CASE = "case_review"
 PHASE_DOWNLOAD = "download"
+
+# 单次大模型请求超时（秒），避免网络抖动把会话永久挂住。
+LLM_REQUEST_TIMEOUT_SECONDS = 120.0
+# 单个阶段任务的整体等待上限（秒）。大模型生成用例可能较慢，
+# 因此给一个较宽松的兜底值，超时后放弃等待并释放 UI。
+TASK_TIMEOUT_SECONDS = 900.0
 
 T = TypeVar("T")
 
@@ -78,6 +85,9 @@ def get_graph_and_llm() -> tuple[Any, ChatOpenAI]:
         api_key=api_key,
         base_url=base_url,
         temperature=0,
+        # 不设置超时会导致单次网络抖动就把整个 Streamlit 会话永久挂住。
+        timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+        max_retries=2,
     )
     return create_workflow(), llm
 
@@ -279,25 +289,38 @@ def _reset_flow() -> None:
     st.session_state.excel_output_path = ""
 
 
-def _run_with_progress(task_label: str, fn: Callable[[], T]) -> T:
+def _run_with_progress(
+    task_label: str,
+    fn: Callable[[], T],
+    timeout: float = TASK_TIMEOUT_SECONDS,
+) -> T:
     """Run a blocking task with visible progress and elapsed time."""
     status = st.status(f"{task_label}中...", expanded=True)
     progress = st.progress(0, text=f"{task_label}（预估进度）")
     start = time.time()
     progress_value = 5
 
+    # 不使用 with ThreadPoolExecutor(...)：其 __exit__ 会 shutdown(wait=True) 死等，
+    # 一旦任务挂住就会永久占用 Streamlit 脚本线程、并阻塞进程退出。
+    # 这里改为手动管理，配合超时与 wait=False 释放。
+    executor = ThreadPoolExecutor(max_workers=1)
     try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(fn)
-            while not future.done():
-                elapsed = int(time.time() - start)
-                progress_value = min(progress_value + 2, 92)
-                progress.progress(
-                    progress_value,
-                    text=f"{task_label}（预估进度） - 已等待 {elapsed}s",
+        future = executor.submit(fn)
+        while not future.done():
+            elapsed = time.time() - start
+            if elapsed > timeout:
+                raise TimeoutError(
+                    f"{task_label}超时：已等待 {int(elapsed)}s，超过上限 {int(timeout)}s。"
                 )
-                time.sleep(0.2)
-            result = future.result()
+            progress_value = min(progress_value + 2, 92)
+            progress.progress(
+                progress_value,
+                text=f"{task_label}（预估进度） - 已等待 {int(elapsed)}s",
+            )
+            time.sleep(0.2)
+
+        remaining = max(timeout - (time.time() - start), 1.0)
+        result = future.result(timeout=remaining)
 
         total = time.time() - start
         progress.progress(100, text=f"{task_label}完成")
@@ -310,6 +333,9 @@ def _run_with_progress(task_label: str, fn: Callable[[], T]) -> T:
     except Exception:
         status.update(label=f"{task_label}失败", state="error", expanded=True)
         raise
+    finally:
+        # 不等待仍在运行的任务：避免挂住脚本线程，也避免非守护线程拖住进程退出。
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _prime_editors_from_values(values: dict[str, Any], phase: str) -> None:
@@ -494,13 +520,20 @@ def _render_testcase_kb_uploader() -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_root = Path(tmp_dir)
             for uploaded in uploaded_files:
-                file_name = uploaded.name
+                # 文件名来自客户端，必须取 basename 净化，否则 "../" 或绝对路径
+                # 会让写入逃出临时目录（CWE-22 路径穿越）。
+                file_name = Path(str(uploaded.name)).name
                 suffix = Path(file_name).suffix.lower()
                 if suffix not in {".md", ".docx"}:
                     results.append((file_name, False, "仅支持 md/docx"))
                     continue
 
                 tmp_path = tmp_root / file_name
+                # 纵深防御：确认解析后的路径仍在临时目录内。
+                if not tmp_path.resolve().is_relative_to(tmp_root.resolve()):
+                    results.append((file_name, False, "非法文件名"))
+                    continue
+
                 tmp_path.write_bytes(uploaded.getvalue())
                 try:
                     chunks = index_testcase_knowledge_file(
@@ -829,6 +862,12 @@ def main() -> None:
     _ensure_session()
     with st.sidebar:
         st.subheader("RAG 设置")
+        # 降级必须显式告知用户，否则检索质量会无声崩塌且无人察觉。
+        if is_embedding_degraded():
+            st.error(
+                "⚠️ Embedding 服务不可用，已降级为本地哈希向量，"
+                "检索结果严重失真。请检查 OPENAI_API_KEY / 网络后重启应用。"
+            )
         st.session_state.enable_multi_query = st.toggle(
             "启用 Multi-Query",
             value=st.session_state.enable_multi_query,

@@ -330,7 +330,17 @@ def export_excel_node(
     print("--- 执行 Excel 导出 Node ---")
     _ = config
 
-    cases_for_export = state["modified_test_cases"] or state["test_cases"]
+    # 注意：这里不能用 `modified_test_cases or test_cases`。
+    # 空列表是合法的人工审核结果（用户删掉了所有用例），用 or 判定会静默回退到
+    # 未审核的 AI 原始用例，使人工审核形同虚设。
+    modified_cases = state.get("modified_test_cases")
+    if modified_cases is None:
+        modified_cases = state.get("test_cases", [])
+    cases_for_export = list(modified_cases)
+
+    if not cases_for_export:
+        raise ValueError("没有可导出的测试用例：人工审核结果为空，请至少保留一条用例。")
+
     output_dir = PROJECT_ROOT / "output"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = output_dir / f"test_cases_{timestamp}.xlsx"
