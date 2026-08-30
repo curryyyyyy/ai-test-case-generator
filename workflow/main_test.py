@@ -5,8 +5,8 @@ from pprint import pprint
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
-from state import TestCaseState
-from workflow import create_workflow
+from workflow.state import TestCaseState
+from workflow.workflow import create_workflow
 
 
 def build_initial_state() -> TestCaseState:

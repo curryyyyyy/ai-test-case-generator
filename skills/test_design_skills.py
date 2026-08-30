@@ -8,10 +8,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field, ValidationError
 
-try:
-    from workflow.schemas import TestCase, TestOutline, TestPoint
-except ModuleNotFoundError:
-    from schemas import TestCase, TestOutline, TestPoint
+from workflow.schemas import TestCase, TestOutline, TestPoint
 
 
 class RequirementAnalysisOutput(BaseModel):

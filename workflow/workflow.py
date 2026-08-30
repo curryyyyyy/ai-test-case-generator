@@ -3,14 +3,14 @@
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from nodes import (
+from .nodes import (
     analyze_requirement_node,
     export_excel_node,
     extract_test_points_node,
     generate_cases_node,
     generate_outline_node,
 )
-from state import TestCaseState
+from .state import TestCaseState
 
 
 workflow = StateGraph(TestCaseState)

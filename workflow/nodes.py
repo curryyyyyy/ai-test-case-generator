@@ -1,14 +1,13 @@
 import asyncio
 from datetime import datetime
 from pathlib import Path
-import sys
 import time
 from typing import Any, cast
 
-# Ensure project root is importable before importing project packages.
+# 项目根目录（导出产物落盘位置）。
+# 注意：这里不再做 sys.path 注入——路径统一由入口（app/app.py）或
+# 包安装（pip install -e .）保证，避免各处散落的路径操作互相干扰。
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.append(str(PROJECT_ROOT))
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import RunnableConfig
@@ -19,7 +18,7 @@ from rag.retriever import (
     retrieve_testcase_context_with_meta,
     retrieve_context_with_meta,
 )
-from state import TestCaseState
+from .state import TestCaseState
 from utils.excel_exporter.excel_exporter import export_test_cases_to_excel
 
 from skills.test_design_skills import (  # noqa: E402

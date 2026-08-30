@@ -18,18 +18,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # 进程启动后修改 .env 将无法重新加载，必须重启进程。
 load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 
-WORKFLOW_DIR = PROJECT_ROOT / "workflow"
+# 应用入口的 sys.path 引导：让项目根下的 rag / skills / utils / workflow 包可被导入。
+# 只需根目录；绝不能把 workflow/ 目录本身加进来，否则 `import workflow`
+# 会命中 workflow/workflow.py 模块而遮蔽 workflow 包，进而造成循环导入。
+# 执行 `pip install -e .` 后下面这段会自动跳过（其他 CLI 脚本各自也带同样引导）。
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
-if str(WORKFLOW_DIR) not in sys.path:
-    sys.path.append(str(WORKFLOW_DIR))
 
 from utils.document_parser.docx_parser import parse_docx
 from utils.document_parser.md_parser import parse_markdown
 from rag.ingest import index_document
 from rag.ingest import index_testcase_knowledge_file
 from rag.store import is_embedding_degraded
-from workflow import create_workflow
+from workflow.workflow import create_workflow
 
 
 PHASE_UPLOAD = "upload"
@@ -412,22 +413,12 @@ def _replay_to_phase(graph: Any, llm: ChatOpenAI, target_phase: str) -> None:
 
 def _rerun_current_phase(graph: Any, llm: ChatOpenAI, phase: str) -> None:
     """Re-run generation for current phase based on existing checkpoint state."""
-    # workflow 目录在运行时已加入 sys.path，因此可直接导入 nodes 模块。
-    # 先用静态可解析的方式导入（供类型检查/IDE 识别），失败再退回 sys.path 方式。
-    try:  # pragma: no cover - 静态解析兜底
-        from workflow.nodes import (  # type: ignore
-            analyze_requirement_node,
-            extract_test_points_node,
-            generate_cases_node,
-            generate_outline_node,
-        )
-    except ImportError:
-        from nodes import (  # type: ignore
-            analyze_requirement_node,
-            extract_test_points_node,
-            generate_cases_node,
-            generate_outline_node,
-        )
+    from workflow.nodes import (
+        analyze_requirement_node,
+        extract_test_points_node,
+        generate_cases_node,
+        generate_outline_node,
+    )
 
     config = _build_config(llm)
     values = _get_state_values(graph, config)
