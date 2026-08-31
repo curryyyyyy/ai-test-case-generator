@@ -14,6 +14,10 @@ HEADER_MAP: list[tuple[str, str]] = [
     ("precondition", "前置条件"),
     ("steps", "测试步骤"),
     ("expected_result", "预期结果"),
+    # 关联风险打通「风险 → 策略 → 用例 → 回归」的追溯链，
+    # 下游 regression-testing 按 risk_ref 反查覆盖。
+    ("risk_ref", "关联风险"),
+    ("evidence_source", "文档依据"),
 ]
 
 

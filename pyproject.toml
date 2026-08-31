@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-test-case-generator"
-version = "0.1.0"
-description = "基于 LangGraph + RAG 的 AI 测试用例生成工具"
+version = "0.2.0"
+description = "基于 LangGraph + RAG 的 AI 测试用例生成工具（集成 qa-skills 八阶段流水线）"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -22,11 +22,13 @@ dependencies = [
     "mistune",
     "python-docx",
     "sentence-transformers",
+    # Schema 落盘与校验使用；缺失时自动退化为内置序列化器与基础 lint。
+    "PyYAML",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["rag*", "skills*", "utils*", "workflow*"]
+include = ["rag*", "skills*", "utils*", "workflow*", "execution*"]
 
 [tool.setuptools.package-data]
 skills = ["*.md"]

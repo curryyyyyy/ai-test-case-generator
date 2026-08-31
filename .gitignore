@@ -45,5 +45,7 @@ Thumbs.db
 # Project runtime data
 data/
 output/
+# 流水线落盘产物（需求模型/策略/用例 markmap/schema/报告），同 data/ 一样属运行时数据
+artifacts/
 streamlit_stdout.log
 .gitignore
