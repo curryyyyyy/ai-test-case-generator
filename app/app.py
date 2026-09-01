@@ -43,6 +43,8 @@ PHASE_DOWNLOAD = "download"
 
 # 单次大模型请求超时（秒），避免网络抖动把会话永久挂住。
 LLM_REQUEST_TIMEOUT_SECONDS = 120.0
+# 默认聊天模型；可用 .env 的 OPENAI_MODEL 覆盖，切换模型无需改代码。
+DEFAULT_CHAT_MODEL = "Qwen/Qwen3.5-35B-A3B"
 # 单个阶段任务的整体等待上限（秒）。大模型生成用例可能较慢，
 # 因此给一个较宽松的兜底值，超时后放弃等待并释放 UI。
 TASK_TIMEOUT_SECONDS = 900.0
@@ -82,8 +84,9 @@ def get_graph_and_llm() -> tuple[Any, ChatOpenAI]:
         raise ValueError("未检测到 OPENAI_API_KEY，请先在项目根目录 .env 配置。")
 
     base_url = os.getenv("OPENAI_BASE_URL")
+    model = os.getenv("OPENAI_MODEL") or DEFAULT_CHAT_MODEL
     llm = ChatOpenAI(
-        model="Qwen/Qwen3.5-35B-A3B",
+        model=model,
         api_key=api_key,
         base_url=base_url,
         temperature=0,

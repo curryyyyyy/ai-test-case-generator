@@ -1,0 +1,7 @@
+[server]
+# 关闭源码热更新监听。
+# Streamlit 默认会遍历 sys.modules 里所有模块（含 sentence-transformers 间接引入的
+# transformers），逐个 import 探测路径，导致控制台刷大量
+# "ModuleNotFoundError: No module named 'torchvision'" 之类的噪音日志。
+# 这些日志不影响功能，关掉 watcher 即可彻底消除。
+fileWatcherType = "none"

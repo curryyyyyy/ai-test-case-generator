@@ -9,6 +9,10 @@ from workflow.state import TestCaseState
 from workflow.workflow import create_workflow
 
 
+# 默认聊天模型；可用 .env 的 OPENAI_MODEL 覆盖，与 app/app.py 保持一致。
+DEFAULT_CHAT_MODEL = "Qwen/Qwen3.5-35B-A3B"
+
+
 def build_initial_state() -> TestCaseState:
     """构造用于首次运行的初始状态。"""
     return {
@@ -43,7 +47,7 @@ def build_llm_from_env() -> ChatOpenAI:
     base_url = os.getenv("OPENAI_BASE_URL")
 
     return ChatOpenAI(
-        model="Qwen/Qwen3.5-35B-A3B",
+        model=os.getenv("OPENAI_MODEL") or DEFAULT_CHAT_MODEL,
         api_key=api_key,
         base_url=base_url,
         temperature=0,

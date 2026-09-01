@@ -49,10 +49,16 @@ class LocalHashEmbeddings(Embeddings):
 def _build_openai_embeddings() -> OpenAIEmbeddings:
     # 显式指定 .env 路径，避免依赖进程 CWD 导致读不到 key 而静默降级。
     load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
+    # Embedding 允许走独立的 base_url：聊天可能用厂商的专用端点（如 Coding Plan 的
+    # /api/coding/v3），而 embedding 只能用标准 /api/v3，两者必须能分开配。
+    # 未配置时回落到 OPENAI_BASE_URL，保持原有行为。
+    embedding_base = (
+        os.getenv("RAG_EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+    )
     return OpenAIEmbeddings(
         model=os.getenv("RAG_EMBEDDING_MODEL", EMBEDDING_MODEL),
         openai_api_key=os.getenv("OPENAI_API_KEY"),
-        openai_api_base=os.getenv("OPENAI_BASE_URL"),
+        openai_api_base=embedding_base,
     )
 
 
