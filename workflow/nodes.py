@@ -21,6 +21,7 @@ from rag.retriever import (
 )
 from .state import TestCaseState
 from utils.excel_exporter.excel_exporter import export_test_cases_to_excel
+from utils.exporters.csv_exporter import export_test_cases_to_csv
 
 from skills.test_design_skills import (  # noqa: E402
     analyze_requirement_skill,
@@ -355,14 +356,23 @@ def generate_cases_node(
     }
 
 
+# 导出格式 -> (文件后缀, 导出函数)。新增格式时只需在这里加一行。
+EXPORTERS: dict[str, tuple[str, Any]] = {
+    "excel": (".xlsx", export_test_cases_to_excel),
+    "csv": (".csv", export_test_cases_to_csv),
+}
+DEFAULT_EXPORT_FORMAT = "excel"
+
+
 def export_excel_node(
     state: TestCaseState,
     config: RunnableConfig | None = None,
 ) -> dict[str, Any]:
-    """导出测试用例为 Excel 文件并返回输出路径。"""
-    print("--- 执行 Excel 导出 Node ---")
-    _ = config
+    """导出测试用例为文件并返回输出路径。
 
+    函数名保留 export_excel_node：LangGraph 的节点名已固化在工作流和
+    checkpoint 里，改名会让历史会话无法恢复。
+    """
     # 注意：这里不能用 `modified_test_cases or test_cases`。
     # 空列表是合法的人工审核结果（用户删掉了所有用例），用 or 判定会静默回退到
     # 未审核的 AI 原始用例，使人工审核形同虚设。
@@ -374,11 +384,20 @@ def export_excel_node(
     if not cases_for_export:
         raise ValueError("没有可导出的测试用例：人工审核结果为空，请至少保留一条用例。")
 
+    export_format = str(
+        _get_config_value(config, "export_format", DEFAULT_EXPORT_FORMAT)
+    ).strip().lower()
+    if export_format not in EXPORTERS:
+        export_format = DEFAULT_EXPORT_FORMAT
+    suffix, exporter = EXPORTERS[export_format]
+
+    print(f"--- 执行用例导出 Node（{export_format}） ---")
+
     output_dir = PROJECT_ROOT / "output"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"test_cases_{timestamp}.xlsx"
+    output_file = output_dir / f"test_cases_{timestamp}{suffix}"
 
-    excel_output_path = export_test_cases_to_excel(
+    excel_output_path = exporter(
         test_cases=cases_for_export,
         output_file_path=output_file,
     )

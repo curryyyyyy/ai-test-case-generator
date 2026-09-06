@@ -138,6 +138,8 @@ def _ensure_session() -> None:
         st.session_state.chunk_overlap = CHUNK_OVERLAP
     if "extra_instruction" not in st.session_state:
         st.session_state.extra_instruction = ""
+    if "export_format" not in st.session_state:
+        st.session_state.export_format = "excel"
 
 
 def _build_config(llm: ChatOpenAI) -> dict[str, Any]:
@@ -151,6 +153,7 @@ def _build_config(llm: ChatOpenAI) -> dict[str, Any]:
             "retriever_top_k": st.session_state.retriever_top_k,
             "rerank_mode": st.session_state.rerank_mode,
             "extra_instruction": st.session_state.extra_instruction,
+            "export_format": st.session_state.export_format,
         }
     }
 
@@ -522,11 +525,15 @@ def _render_advanced_settings() -> None:
         )
         st.session_state.rerank_mode = st.selectbox(
             "Rerank 模式",
-            options=["cross_encoder", "lite"],
-            index=0 if st.session_state.rerank_mode == "cross_encoder" else 1,
+            options=["cross_encoder", "api", "lite"],
+            index=["cross_encoder", "api", "lite"].index(st.session_state.rerank_mode)
+            if st.session_state.rerank_mode in ("cross_encoder", "api", "lite")
+            else 0,
             help=(
                 "cross_encoder：本地交叉编码器，更准但依赖模型缓存；"
-                "lite：关键词重合度打分，零依赖。模型不可用时会自动降级为 lite。"
+                "api：调用外部 /rerank 服务（需在 .env 配置 RERANK_API_BASE_URL / "
+                "RERANK_API_MODEL）；lite：关键词重合度打分，零依赖。"
+                "前两者失败时自动降级为 lite。"
             ),
         )
         st.session_state.chunk_size = int(
@@ -559,6 +566,15 @@ def _render_advanced_settings() -> None:
             height=90,
             placeholder="例：用例必须包含数据校验步骤；异常分支优先级高于正常流程。",
             help="会追加到每个阶段 Prompt 的末尾，不改代码即可约束生成风格。",
+        )
+        st.session_state.export_format = st.selectbox(
+            "导出格式",
+            options=["excel", "csv"],
+            index=0 if st.session_state.export_format == "excel" else 1,
+            help=(
+                "excel：带样式的 xlsx；csv：UTF-8 BOM，可直接导入 TestLink / "
+                "Jira / 禅道等平台。"
+            ),
         )
 
 
@@ -893,22 +909,34 @@ def _render_case_page(graph: Any, llm: ChatOpenAI) -> None:
     _render_retrieval_evidence(values, "generate_cases_testcase", "历史用例参考片段")
 
 
+# 导出格式 -> 下载时的 MIME 类型。
+EXPORT_MIME_TYPES: dict[str, str] = {
+    "excel": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "csv": "text/csv; charset=utf-8",
+}
+
+
 def _render_download_page() -> None:
     st.subheader("6. 下载测试用例")
     excel_output_path = st.session_state.excel_output_path
 
     if excel_output_path and Path(excel_output_path).exists():
         output_path = Path(excel_output_path)
+        # MIME 按实际后缀取，避免导出 CSV 时仍按 Excel 类型下载。
+        suffix = output_path.suffix.lower()
+        export_format = (
+            "csv" if suffix == ".csv" else "excel"
+        )
         st.success(f"已生成文件：{output_path}")
         st.download_button(
-            label="下载 Excel 文件",
+            label=f"下载 {export_format.upper()} 文件",
             data=output_path.read_bytes(),
             file_name=output_path.name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            mime=EXPORT_MIME_TYPES[export_format],
             type="primary",
         )
     else:
-        st.warning("未找到导出的 Excel 文件，请返回上一步重新导出。")
+        st.warning("未找到导出的文件，请返回上一步重新导出。")
 
     if st.button("生成新的测试用例"):
         _reset_flow()

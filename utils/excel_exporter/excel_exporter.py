@@ -5,16 +5,11 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, Side
 from openpyxl.worksheet.worksheet import Worksheet
 
+from utils.exporters.testcase_fields import TESTCASE_HEADERS, normalize_cell_value
 
-HEADER_MAP: list[tuple[str, str]] = [
-    ("case_id", "用例ID"),
-    ("directory", "模块"),
-    ("test_point", "功能点"),
-    ("case_level", "优先级"),
-    ("precondition", "前置条件"),
-    ("steps", "测试步骤"),
-    ("expected_result", "预期结果"),
-]
+
+# 兼容旧引用：HEADER_MAP 现指向共享定义，避免两处字段顺序各写一份。
+HEADER_MAP = TESTCASE_HEADERS
 
 
 def _write_header(worksheet: Worksheet) -> None:
@@ -32,15 +27,6 @@ def _write_header(worksheet: Worksheet) -> None:
         cell.border = thin_border
 
 
-def _normalize_cell_value(field_name: str, test_case: dict[str, Any]) -> str:
-    raw_value = test_case.get(field_name, "")
-    if field_name == "steps":
-        if isinstance(raw_value, list):
-            return "\n".join(str(item) for item in raw_value)
-        return str(raw_value)
-    return str(raw_value)
-
-
 def _write_data_rows(worksheet: Worksheet, test_cases: list[dict[str, Any]]) -> None:
     thin_border = Border(
         left=Side(style="thin"),
@@ -54,7 +40,7 @@ def _write_data_rows(worksheet: Worksheet, test_cases: list[dict[str, Any]]) -> 
             cell = worksheet.cell(
                 row=row_index,
                 column=col_index,
-                value=_normalize_cell_value(field_name, test_case),
+                value=normalize_cell_value(field_name, test_case),
             )
             cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
             cell.border = thin_border

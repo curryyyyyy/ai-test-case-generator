@@ -21,6 +21,8 @@ QUERY_COUNT = 3
 PER_QUERY_TOP_K = 3
 
 ENABLE_RERANK = True
+# 可选值：cross_encoder（本地交叉编码器）/ lite（关键词重合度）/ api（外部 /rerank 服务）。
+# cross_encoder 需要本地模型缓存，国内网络常下载失败，此时会自动降级为 lite。
 RERANK_MODE = "cross_encoder"
 RERANK_CROSS_ENCODER_MODEL = "BAAI/bge-reranker-v2-m3"
 RERANK_CROSS_ENCODER_LOCAL_FILES_ONLY = True
