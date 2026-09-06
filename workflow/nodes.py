@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import RunnableConfig
 
+from rag.config import RETRIEVER_TOP_K
 from rag.retriever import (
     build_citations,
     format_retrieved_context,
@@ -116,14 +117,18 @@ def _build_retrieval_for_phase(
         configurable = config.get("configurable", {})
     enable_multi_query = configurable.get("enable_multi_query", None)
     enable_rerank = configurable.get("enable_rerank", None)
+    top_k = _get_config_value(config, "retriever_top_k", RETRIEVER_TOP_K)
+    rerank_mode = _get_config_value(config, "rerank_mode", None)
 
     start = time.time()
     chunks, meta = retrieve_context_with_meta(
         query=query,
         doc_id=doc_id,
         doc_type=doc_type,
+        top_k=int(top_k),
         multi_query=enable_multi_query,
         enable_rerank=enable_rerank,
+        rerank_mode=rerank_mode,
     )
     elapsed_ms = int((time.time() - start) * 1000)
     citations = build_citations(chunks, limit=5)
@@ -161,6 +166,22 @@ def _get_llm_from_config(config: RunnableConfig | None) -> BaseChatModel:
     return cast(BaseChatModel, llm)
 
 
+def _get_config_value(
+    config: RunnableConfig | None,
+    key: str,
+    default: Any,
+) -> Any:
+    """从运行时 configurable 读取可调参数。
+
+    所有「侧边栏开关」统一走这里：新增一个 UI 参数时，节点层只多读一个 key，
+    不用改节点函数签名——LangGraph 的 configurable 本身就是旁路通道。
+    """
+    if config is None:
+        return default
+    value = config.get("configurable", {}).get(key, None)
+    return default if value is None else value
+
+
 def analyze_requirement_node(
     state: TestCaseState,
     config: RunnableConfig | None = None,
@@ -180,6 +201,7 @@ def analyze_requirement_node(
             llm=llm,
             structured_doc=state["structured_doc"],
             retrieved_context=retrieved_context,
+            extra_instruction=_get_config_value(config, "extra_instruction", ""),
         )
     )
     return {
@@ -210,6 +232,7 @@ def extract_test_points_node(
             llm=llm,
             requirement_analysis=state["requirement_analysis"],
             retrieved_context=retrieved_context,
+            extra_instruction=_get_config_value(config, "extra_instruction", ""),
         )
     )
     return {
@@ -242,6 +265,7 @@ def generate_outline_node(
             requirement_analysis=state["requirement_analysis"],
             test_points=state["test_points"],
             retrieved_context=retrieved_context,
+            extra_instruction=_get_config_value(config, "extra_instruction", ""),
         )
     )
     return {
@@ -282,16 +306,10 @@ def generate_cases_node(
     testcase_start = time.time()
     testcase_chunks, testcase_meta = retrieve_testcase_context_with_meta(
         query=testcase_query,
-        multi_query=(
-            config.get("configurable", {}).get("enable_multi_query", None)
-            if config is not None
-            else None
-        ),
-        enable_rerank=(
-            config.get("configurable", {}).get("enable_rerank", None)
-            if config is not None
-            else None
-        ),
+        top_k=int(_get_config_value(config, "retriever_top_k", RETRIEVER_TOP_K)),
+        multi_query=_get_config_value(config, "enable_multi_query", None),
+        enable_rerank=_get_config_value(config, "enable_rerank", None),
+        rerank_mode=_get_config_value(config, "rerank_mode", None),
     )
     testcase_elapsed_ms = int((time.time() - testcase_start) * 1000)
     testcase_context = format_retrieved_context(testcase_chunks)
@@ -328,6 +346,7 @@ def generate_cases_node(
             requirement_analysis=state["requirement_analysis"],
             outline_for_generation=outline_for_generation,
             retrieved_context=combined_context,
+            extra_instruction=_get_config_value(config, "extra_instruction", ""),
         )
     )
     return {

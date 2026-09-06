@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from utils.document_parser.docx_parser import parse_docx
 from utils.document_parser.md_parser import parse_markdown
+from rag.config import CHUNK_OVERLAP, CHUNK_SIZE, RERANK_MODE, RETRIEVER_TOP_K
 from rag.ingest import index_document
 from rag.ingest import index_testcase_knowledge_file
 from rag.store import is_embedding_degraded
@@ -125,6 +126,18 @@ def _ensure_session() -> None:
         st.session_state.enable_multi_query = True
     if "enable_rerank" not in st.session_state:
         st.session_state.enable_rerank = True
+    # 以下是「高级参数」。默认值一律取自 rag/config.py，
+    # 保证不碰侧边栏时行为与改动前完全一致。
+    if "retriever_top_k" not in st.session_state:
+        st.session_state.retriever_top_k = RETRIEVER_TOP_K
+    if "rerank_mode" not in st.session_state:
+        st.session_state.rerank_mode = RERANK_MODE
+    if "chunk_size" not in st.session_state:
+        st.session_state.chunk_size = CHUNK_SIZE
+    if "chunk_overlap" not in st.session_state:
+        st.session_state.chunk_overlap = CHUNK_OVERLAP
+    if "extra_instruction" not in st.session_state:
+        st.session_state.extra_instruction = ""
 
 
 def _build_config(llm: ChatOpenAI) -> dict[str, Any]:
@@ -134,6 +147,10 @@ def _build_config(llm: ChatOpenAI) -> dict[str, Any]:
             "llm": llm,
             "enable_multi_query": st.session_state.enable_multi_query,
             "enable_rerank": st.session_state.enable_rerank,
+            # 高级参数走同一条旁路通道，节点侧用 _get_config_value 读取。
+            "retriever_top_k": st.session_state.retriever_top_k,
+            "rerank_mode": st.session_state.rerank_mode,
+            "extra_instruction": st.session_state.extra_instruction,
         }
     }
 
@@ -472,6 +489,8 @@ def _render_upload_page(graph: Any, llm: ChatOpenAI) -> None:
                 doc_id=doc_id,
                 source_name=uploaded_file.name,
                 structured_doc=structured_doc,
+                chunk_size=int(st.session_state.chunk_size),
+                chunk_overlap=int(st.session_state.chunk_overlap),
             )
             st.session_state.source_document = document
             st.session_state.source_structured_doc = structured_doc
@@ -482,6 +501,65 @@ def _render_upload_page(graph: Any, llm: ChatOpenAI) -> None:
             st.rerun()
         except Exception as exc:
             st.error(f"启动流程失败：{exc}")
+
+
+def _render_advanced_settings() -> None:
+    """侧边栏「高级参数」面板。
+
+    这些参数原本是 rag/config.py 里的常量，调一次要改代码、重启进程。
+    这里把它们提到运行时：检索类参数下一次生成即生效，切块类参数只在入库时生效。
+    """
+    with st.expander("高级参数", expanded=False):
+        st.session_state.retriever_top_k = int(
+            st.number_input(
+                "检索返回条数 top_k",
+                min_value=1,
+                max_value=50,
+                value=int(st.session_state.retriever_top_k),
+                step=1,
+                help="每个阶段检索最多保留的片段数，改完下一次生成立即生效。",
+            )
+        )
+        st.session_state.rerank_mode = st.selectbox(
+            "Rerank 模式",
+            options=["cross_encoder", "lite"],
+            index=0 if st.session_state.rerank_mode == "cross_encoder" else 1,
+            help=(
+                "cross_encoder：本地交叉编码器，更准但依赖模型缓存；"
+                "lite：关键词重合度打分，零依赖。模型不可用时会自动降级为 lite。"
+            ),
+        )
+        st.session_state.chunk_size = int(
+            st.number_input(
+                "切块大小（字符）",
+                min_value=100,
+                max_value=2000,
+                value=int(st.session_state.chunk_size),
+                step=50,
+            )
+        )
+        # overlap 必须小于 size，否则 ingest._chunk_text 会强制按比例缩小。
+        max_overlap = max(int(st.session_state.chunk_size) - 1, 0)
+        st.session_state.chunk_overlap = int(
+            st.number_input(
+                "切块重叠（字符）",
+                min_value=0,
+                max_value=max_overlap,
+                value=min(int(st.session_state.chunk_overlap), max_overlap),
+                step=10,
+            )
+        )
+        st.caption(
+            "切块参数仅在「上传文档 / 入库知识库」时生效，"
+            "已入库内容不会重新切分，改动后需重新上传。"
+        )
+        st.session_state.extra_instruction = st.text_area(
+            "全局附加要求",
+            value=st.session_state.extra_instruction,
+            height=90,
+            placeholder="例：用例必须包含数据校验步骤；异常分支优先级高于正常流程。",
+            help="会追加到每个阶段 Prompt 的末尾，不改代码即可约束生成风格。",
+        )
 
 
 def _render_testcase_kb_uploader() -> None:
@@ -536,6 +614,8 @@ def _render_testcase_kb_uploader() -> None:
                         module=module.strip(),
                         test_type=test_type.strip(),
                         priority=priority.strip(),
+                        chunk_size=int(st.session_state.chunk_size),
+                        chunk_overlap=int(st.session_state.chunk_overlap),
                     )
                     results.append((file_name, True, f"成功，chunks={chunks}"))
                 except Exception as exc:
@@ -871,6 +951,7 @@ def main() -> None:
             "启用 Rerank",
             value=st.session_state.enable_rerank,
         )
+        _render_advanced_settings()
         st.divider()
         _render_testcase_kb_uploader()
 

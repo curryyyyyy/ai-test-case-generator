@@ -171,7 +171,15 @@ def index_document(
     structured_doc: dict[str, Any],
     doc_type: str = "requirement",
     extra_metadata: dict[str, str] | None = None,
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
 ) -> int:
+    """把结构化文档切块并写入向量库。
+
+    chunk_size / chunk_overlap 可在运行时覆盖 rag/config.py 的常量：
+    切块粒度直接决定检索命中率，不同文档（长 PRD vs 短接口说明）适合不同值，
+    因此不能写死。注意：这只影响本次入库，已入库的 chunk 不会重新切分。
+    """
     metadata = extra_metadata or {}
     chunk_list = _walk_sections(
         section=structured_doc,
@@ -180,8 +188,8 @@ def index_document(
         doc_id=doc_id,
         doc_type=doc_type,
         extra_metadata=metadata,
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
+        chunk_size=CHUNK_SIZE if chunk_size is None else chunk_size,
+        chunk_overlap=CHUNK_OVERLAP if chunk_overlap is None else chunk_overlap,
     )
     if not chunk_list:
         return 0
@@ -220,6 +228,8 @@ def index_testcase_knowledge_file(
     module: str = "",
     test_type: str = "",
     priority: str = "",
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
 ) -> int:
     path = Path(file_path)
     if not path.exists():
@@ -244,4 +254,6 @@ def index_testcase_knowledge_file(
             "test_type": test_type,
             "priority": priority,
         },
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
     )

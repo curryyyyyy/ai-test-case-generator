@@ -1,5 +1,6 @@
 ﻿import json
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
@@ -50,9 +51,31 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 PROMPT_DIR = Path(__file__).resolve().parent
 
 
-def _load_prompt_template(file_name: str) -> str:
+@lru_cache(maxsize=64)
+def _read_prompt_file(file_name: str, mtime: float) -> str:
+    """按文件 mtime 缓存 Prompt 内容。
+
+    mtime 进缓存键：改完 md 文件下一次调用就会读到新内容，
+    不必重启 Streamlit 进程，把 Prompt 当配置反复调优。
+    """
+    return (PROMPT_DIR / file_name).read_text(encoding="utf-8").strip()
+
+
+def _load_prompt_template(file_name: str, extra_instruction: str = "") -> str:
+    """读取 Prompt 模板，并可选追加全局附加指令。"""
     prompt_path = PROMPT_DIR / file_name
-    return prompt_path.read_text(encoding="utf-8").strip()
+    text = _read_prompt_file(file_name, prompt_path.stat().st_mtime)
+
+    extra = str(extra_instruction or "").strip()
+    if extra:
+        # 直接拼进模板文本而非用模板变量：避免因 md 里没有对应占位符而报错。
+        text = (
+            f"{text}\n\n"
+            "<additional_requirements>\n"
+            f"{extra}\n"
+            "</additional_requirements>"
+        )
+    return text.strip()
 
 
 def _extract_text_content(content: Any) -> str:
@@ -251,10 +274,11 @@ async def analyze_requirement_skill(
     llm: BaseChatModel,
     structured_doc: dict[str, Any],
     retrieved_context: str = "",
+    extra_instruction: str = "",
 ) -> str:
     """分析结构化文档，生成需求分析报告。"""
     prompt = ChatPromptTemplate.from_template(
-        _load_prompt_template("analyze_requirement_skill.md")
+        _load_prompt_template("analyze_requirement_skill.md", extra_instruction)
     )
 
     result = await _invoke_structured_output(
@@ -283,10 +307,11 @@ async def extract_test_points_skill(
     llm: BaseChatModel,
     requirement_analysis: str,
     retrieved_context: str = "",
+    extra_instruction: str = "",
 ) -> list[TestPoint]:
     """基于需求分析提取测试点列表。"""
     prompt = ChatPromptTemplate.from_template(
-        _load_prompt_template("extract_test_points_skill.md")
+        _load_prompt_template("extract_test_points_skill.md", extra_instruction)
     )
 
     result = await _invoke_structured_output(
@@ -307,10 +332,11 @@ async def generate_outline_skill(
     requirement_analysis: str,
     test_points: list[dict[str, Any]],
     retrieved_context: str = "",
+    extra_instruction: str = "",
 ) -> list[TestOutline]:
     """基于测试点生成分模块测试大纲。"""
     prompt = ChatPromptTemplate.from_template(
-        _load_prompt_template("generate_outline_skill.md")
+        _load_prompt_template("generate_outline_skill.md", extra_instruction)
     )
 
     result = await _invoke_structured_output(
@@ -336,10 +362,11 @@ async def generate_cases_skill(
     requirement_analysis: str,
     outline_for_generation: list[dict[str, Any]],
     retrieved_context: str = "",
+    extra_instruction: str = "",
 ) -> list[TestCase]:
     """基于测试大纲生成结构化测试用例。"""
     prompt = ChatPromptTemplate.from_template(
-        _load_prompt_template("generate_cases_skill.md")
+        _load_prompt_template("generate_cases_skill.md", extra_instruction)
     )
 
     result = await _invoke_structured_output(

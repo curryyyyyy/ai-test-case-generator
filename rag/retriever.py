@@ -385,7 +385,11 @@ def retrieve_context_with_meta(
     multi_query: bool | None = None,
     enable_rerank: bool | None = None,
     extra_filter: dict[str, str] | None = None,
+    rerank_mode: str | None = None,
 ) -> tuple[list[RetrievedChunk], RetrievalMeta]:
+    # 运行时指定的 rerank 模式优先，未指定时回落到 rag/config.py 的常量。
+    # 不能去改全局常量：Streamlit 是多会话共享进程，改常量会跨会话串扰。
+    effective_rerank_mode = RERANK_MODE if rerank_mode is None else rerank_mode
     query_text = str(query).strip()
     if not query_text:
         return (
@@ -394,7 +398,9 @@ def retrieve_context_with_meta(
                 expanded_queries=[],
                 pre_dedup_count=0,
                 post_dedup_count=0,
-                rerank_mode="disabled" if enable_rerank is False else RERANK_MODE,
+                rerank_mode=(
+                    "disabled" if enable_rerank is False else effective_rerank_mode
+                ),
                 rerank_enabled=bool(enable_rerank) if enable_rerank is not None else ENABLE_RERANK,
                 rerank_latency_ms=0,
                 rerank_degraded=False,
@@ -433,7 +439,7 @@ def retrieve_context_with_meta(
         query=query_text,
         candidates=candidate_pool,
         enable_rerank=rerank_enabled,
-        mode=RERANK_MODE,
+        mode=effective_rerank_mode,
         cross_encoder_model=RERANK_CROSS_ENCODER_MODEL,
         cross_encoder_local_files_only=RERANK_CROSS_ENCODER_LOCAL_FILES_ONLY,
         timeout_ms=RERANK_TIMEOUT_MS,
@@ -482,6 +488,7 @@ def retrieve_testcase_context_with_meta(
     module: str = "",
     test_type: str = "",
     priority: str = "",
+    rerank_mode: str | None = None,
 ) -> tuple[list[RetrievedChunk], RetrievalMeta]:
     extra_filter: dict[str, str] = {}
     if module:
@@ -498,6 +505,7 @@ def retrieve_testcase_context_with_meta(
         multi_query=multi_query,
         enable_rerank=enable_rerank,
         extra_filter=extra_filter if extra_filter else None,
+        rerank_mode=rerank_mode,
     )
 
 
