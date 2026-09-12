@@ -13,18 +13,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from rag.ingest import index_document
 from rag.retriever import retrieve_context_with_meta, retrieve_testcase_context_with_meta
-from utils.document_parser.docx_parser import parse_docx
-from utils.document_parser.md_parser import parse_markdown
+from utils.document_parser import parse_file
 
 
 def _load_structured_doc(input_path: Path) -> dict:
-    suffix = input_path.suffix.lower()
-    if suffix == ".md":
-        raw = input_path.read_text(encoding="utf-8")
-        return parse_markdown(raw).to_dict()
-    if suffix == ".docx":
-        return parse_docx(input_path).to_dict()
-    raise ValueError("仅支持 md 或 docx")
+    # 格式分派统一走解析器注册表，新增格式后这里无需改动。
+    return parse_file(input_path).to_dict()
 
 
 def main() -> None:

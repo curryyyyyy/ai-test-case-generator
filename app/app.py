@@ -25,22 +25,31 @@ load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from utils.document_parser.docx_parser import parse_docx
-from utils.document_parser.md_parser import parse_markdown
+from utils.document_parser import parse_bytes, supported_suffixes, supports
 from rag.config import CHUNK_OVERLAP, CHUNK_SIZE, RERANK_MODE, RETRIEVER_TOP_K
 from rag.ingest import index_document
 from rag.ingest import index_testcase_knowledge_file
 from rag.store import is_embedding_degraded
+from workflow import nodes
 from workflow.checkpoint_store import new_thread_id
 from workflow.workflow import create_workflow
 
 
-PHASE_UPLOAD = "upload"
-PHASE_REQUIREMENT = "requirement_review"
-PHASE_TEST_POINTS = "test_points_review"
-PHASE_OUTLINE = "outline_review"
-PHASE_CASE = "case_review"
-PHASE_DOWNLOAD = "download"
+# 阶段定义集中在 app/phases.py（单一事实来源），这里只做导入。
+import app.phases as phases_module  # noqa: E402
+from app.phases import (  # noqa: E402
+    PHASE_CASE,
+    PHASE_DOWNLOAD,
+    PHASE_OUTLINE,
+    PHASE_REQUIREMENT,
+    PHASE_TEST_POINTS,
+    PHASE_UPLOAD,
+    artifact_ready,
+    get_phase,
+    invoke_count as phase_invoke_count,
+    phase_order,
+    rebuild_registry,
+)
 
 # 单次大模型请求超时（秒），避免网络抖动把会话永久挂住。
 LLM_REQUEST_TIMEOUT_SECONDS = 120.0
@@ -52,14 +61,12 @@ TASK_TIMEOUT_SECONDS = 900.0
 
 T = TypeVar("T")
 
-PHASE_ORDER: list[tuple[str, str]] = [
-    (PHASE_UPLOAD, "上传文档"),
-    (PHASE_REQUIREMENT, "需求分析"),
-    (PHASE_TEST_POINTS, "测试点提取"),
-    (PHASE_OUTLINE, "测试大纲"),
-    (PHASE_CASE, "测试用例"),
-    (PHASE_DOWNLOAD, "下载结果"),
-]
+PHASE_ORDER: list[tuple[str, str]] = phase_order()
+
+# 测试点/大纲表格的可选值。schema 里的 Literal 与之对应，
+# 调整时需要同时改 workflow/schemas.py 的枚举定义。
+TEST_TYPE_OPTIONS = ["功能", "性能", "安全", "兼容性"]
+PRIORITY_OPTIONS = ["P0", "P1", "P2", "P3"]
 
 
 def _default_state() -> dict[str, Any]:
@@ -159,27 +166,20 @@ def _build_config(llm: ChatOpenAI) -> dict[str, Any]:
 
 
 def _parse_uploaded_document(uploaded_file: Any) -> tuple[str, dict[str, Any]]:
+    """解析上传的文档，返回 (文档标识, 结构化内容)。
+
+    格式分派全部交给 utils.document_parser.registry：二进制格式的临时文件
+    读写与清理也在注册表里统一处理，这里不再有 per-format 分支。
+    """
+    data = uploaded_file.getvalue()
+    structured = parse_bytes(data, uploaded_file.name).to_dict()
+
     suffix = Path(uploaded_file.name).suffix.lower()
-
     if suffix == ".md":
-        raw_text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
-        structured = parse_markdown(raw_text).to_dict()
-        return raw_text, structured
+        # 纯文本格式保留原文，供后续按需展示。
+        return data.decode("utf-8", errors="ignore"), structured
 
-    if suffix == ".docx":
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_path = Path(tmp_file.name)
-
-        try:
-            structured = parse_docx(tmp_path).to_dict()
-        finally:
-            if tmp_path.exists():
-                tmp_path.unlink()
-
-        return f"DOCX:{uploaded_file.name}", structured
-
-    raise ValueError("仅支持 docx 或 md 文件。")
+    return f"{suffix.lstrip('.').upper()}:{uploaded_file.name}", structured
 
 
 def _get_state_values(graph: Any, config: dict[str, Any]) -> dict[str, Any]:
@@ -300,6 +300,22 @@ def _normalize_cases(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return normalized
 
 
+# 注入表格转换函数并构建阶段表。放在这里是因为 _to_table_rows 系列
+# 定义在上方，避免 app.py 与 phases.py 出现循环导入。
+rebuild_registry(
+    {
+        "test_points": _test_points_to_table_rows,
+        "outline": _outline_to_table_rows,
+        "cases": _cases_to_table_rows,
+    }
+)
+PHASES = phases_module.PHASES
+# 需要逐次 invoke 回放的阶段（上传/下载阶段不参与回放）。
+_REPLAY_ORDER: list[str] = [
+    key for key, _ in PHASE_ORDER if get_phase(key).invoke_count > 0
+]
+
+
 def _reset_flow() -> None:
     st.session_state.phase = PHASE_UPLOAD
     st.session_state.thread_id = new_thread_id()
@@ -364,47 +380,24 @@ def _run_with_progress(
 
 
 def _prime_editors_from_values(values: dict[str, Any], phase: str) -> None:
-    if phase == PHASE_REQUIREMENT:
-        st.session_state.requirement_editor_text = str(values.get("requirement_analysis", ""))
-    if phase == PHASE_TEST_POINTS:
-        st.session_state.test_points_table = _test_points_to_table_rows(values.get("test_points", []))
-    if phase == PHASE_OUTLINE:
-        st.session_state.outline_table = _outline_to_table_rows(values.get("test_outline", []))
-    if phase == PHASE_CASE:
-        st.session_state.test_cases_table = _cases_to_table_rows(values.get("test_cases", []))
+    """按阶段配置表把工作流状态同步到编辑器控件。"""
+    spec = PHASES.get(phase)
+    if spec is None or spec.prime is None:
+        return
+    spec.prime(values)
 
 
 def _phase_artifact_ready(values: dict[str, Any], phase: str) -> bool:
     """判断工作流是否已生成目标阶段的产出物。"""
-    if phase == PHASE_REQUIREMENT:
-        return bool(values.get("requirement_analysis"))
-    if phase == PHASE_TEST_POINTS:
-        return bool(values.get("test_points"))
-    if phase == PHASE_OUTLINE:
-        return bool(values.get("test_outline"))
-    if phase == PHASE_CASE:
-        return bool(values.get("test_cases"))
-    return False
+    return artifact_ready(phase, values)
 
 
 def _replay_to_phase(graph: Any, llm: ChatOpenAI, target_phase: str) -> None:
     if not st.session_state.source_structured_doc:
         raise ValueError("缺少已上传文档，请先上传并开始生成。")
 
-    invoke_count_map = {
-        PHASE_REQUIREMENT: 1,
-        PHASE_TEST_POINTS: 2,
-        PHASE_OUTLINE: 3,
-        PHASE_CASE: 4,
-    }
-    labels = [
-        "正在生成需求分析",
-        "正在提取测试点",
-        "正在生成测试大纲",
-        "正在生成测试用例",
-    ]
-
-    invoke_count = invoke_count_map[target_phase]
+    invoke_count = phase_invoke_count(target_phase)
+    labels = [PHASES[key].rerun_label for key in _REPLAY_ORDER]
     st.session_state.thread_id = new_thread_id()
     config = _build_config(llm)
 
@@ -437,38 +430,21 @@ def _replay_to_phase(graph: Any, llm: ChatOpenAI, target_phase: str) -> None:
 
 def _rerun_current_phase(graph: Any, llm: ChatOpenAI, phase: str) -> None:
     """Re-run generation for current phase based on existing checkpoint state."""
-    from workflow.nodes import (
-        analyze_requirement_node,
-        extract_test_points_node,
-        generate_cases_node,
-        generate_outline_node,
-    )
-
     config = _build_config(llm)
     values = _get_state_values(graph, config)
 
-    if phase == PHASE_REQUIREMENT:
-        updates = _run_with_progress(
-            "正在重新生成需求分析",
-            lambda: analyze_requirement_node(values, config),
-        )
-    elif phase == PHASE_TEST_POINTS:
-        updates = _run_with_progress(
-            "正在重新提取测试点",
-            lambda: extract_test_points_node(values, config),
-        )
-    elif phase == PHASE_OUTLINE:
-        updates = _run_with_progress(
-            "正在重新生成测试大纲",
-            lambda: generate_outline_node(values, config),
-        )
-    elif phase == PHASE_CASE:
-        updates = _run_with_progress(
-            "正在重新生成测试用例",
-            lambda: generate_cases_node(values, config),
-        )
-    else:
+    spec = PHASES.get(phase)
+    if spec is None or not spec.node_name:
         raise ValueError(f"不支持的阶段重生成: {phase}")
+
+    node_fn = getattr(nodes, spec.node_name, None)
+    if node_fn is None:
+        raise ValueError(f"节点未实现: {spec.node_name}")
+
+    updates = _run_with_progress(
+        spec.rerun_label,
+        lambda: node_fn(values, config),
+    )
 
     graph.update_state(config, updates)
     refreshed = _get_state_values(graph, config)
@@ -478,7 +454,10 @@ def _rerun_current_phase(graph: Any, llm: ChatOpenAI, phase: str) -> None:
 
 def _render_upload_page(graph: Any, llm: ChatOpenAI) -> None:
     st.subheader("1. 上传需求文档")
-    uploaded_file = st.file_uploader("支持 docx / md", type=["docx", "md"])
+    uploaded_file = st.file_uploader(
+        f"支持 {' / '.join(suffix.lstrip('.') for suffix in supported_suffixes())}",
+        type=[suffix.lstrip(".") for suffix in supported_suffixes()],
+    )
 
     if st.button("开始生成", type="primary"):
         if uploaded_file is None:
@@ -580,9 +559,12 @@ def _render_advanced_settings() -> None:
 
 def _render_testcase_kb_uploader() -> None:
     st.subheader("测试用例知识库入库")
+    suffix_labels = " / ".join(
+        suffix.lstrip(".") for suffix in supported_suffixes()
+    )
     uploaded_files = st.file_uploader(
-        "上传历史测试用例（md/docx，可多选）",
-        type=["md", "docx"],
+        f"上传历史测试用例（{suffix_labels}，可多选）",
+        type=[suffix.lstrip(".") for suffix in supported_suffixes()],
         accept_multiple_files=True,
         key="testcase_kb_uploader",
     )
@@ -612,9 +594,9 @@ def _render_testcase_kb_uploader() -> None:
                 # 文件名来自客户端，必须取 basename 净化，否则 "../" 或绝对路径
                 # 会让写入逃出临时目录（CWE-22 路径穿越）。
                 file_name = Path(str(uploaded.name)).name
-                suffix = Path(file_name).suffix.lower()
-                if suffix not in {".md", ".docx"}:
-                    results.append((file_name, False, "仅支持 md/docx"))
+                if not supports(file_name):
+                    allowed = " / ".join(suffix.lstrip(".") for suffix in supported_suffixes())
+                    results.append((file_name, False, f"仅支持 {allowed}"))
                     continue
 
                 tmp_path = tmp_root / file_name
@@ -720,41 +702,90 @@ def _render_retrieval_evidence(values: dict[str, Any], phase: str, title: str) -
                     st.text(full_text)
 
 
+def _render_phase_actions(
+    graph: Any,
+    llm: ChatOpenAI,
+    config: dict[str, Any],
+    current_phase: str,
+    advance_label: str,
+    advance_prompt: str,
+    advance_payload: dict[str, Any],
+    advance_error_prefix: str,
+    require_message: str = "",
+    require_ok: bool = True,
+    after_advance: Callable[..., None] | None = None,
+) -> None:
+    """渲染「通过并进入下一阶段 / 重新生成本阶段」这组通用操作。
+
+    重构前这四个页面各写了一遍几乎相同的按钮逻辑（校验、update_state、
+    invoke、同步下一页控件、切阶段、报错），改一处交互要改四遍。
+    现在统一在这里实现，各页面只描述差异。
+    """
+    col1, col2 = st.columns(2)
+
+    if col1.button(advance_label, type="primary"):
+        try:
+            if require_message and not require_ok:
+                raise ValueError(require_message)
+
+            graph.update_state(config, advance_payload)
+            final_state = _run_with_progress(
+                advance_prompt, lambda: graph.invoke(None, config)
+            )
+
+            if after_advance is not None:
+                after_advance(graph, config, final_state)
+
+            next_phase = _next_phase(current_phase)
+            next_values = _get_state_values(graph, config)
+            _prime_editors_from_values(next_values, next_phase)
+            st.session_state.phase = next_phase
+            st.rerun()
+        except Exception as exc:
+            st.error(f"{advance_error_prefix}：{exc}")
+
+    if col2.button(f"重新生成{PHASES[current_phase].label}"):
+        try:
+            _rerun_current_phase(graph, llm, current_phase)
+            st.rerun()
+        except Exception as exc:
+            st.error(f"重新生成失败：{exc}")
+
+
+def _next_phase(current_phase: str) -> str:
+    """按阶段顺序取下一个阶段。"""
+    keys = [key for key, _ in PHASE_ORDER]
+    index = keys.index(current_phase)
+    if index + 1 >= len(keys):
+        return current_phase
+    return keys[index + 1]
+
+
 def _render_requirement_page(graph: Any, llm: ChatOpenAI) -> None:
     st.subheader("2. 审核需求分析")
     config = _build_config(llm)
     values = _get_state_values(graph, config)
-    requirement_analysis = str(values.get("requirement_analysis", ""))
 
     if st.session_state.requirement_editor_text is None:
-        st.session_state.requirement_editor_text = requirement_analysis
+        st.session_state.requirement_editor_text = str(
+            values.get("requirement_analysis", "")
+        )
 
     st.caption("AI 生成需求分析")
     st.text_area("编辑需求分析", key="requirement_editor_text", height=280)
 
-    col1, col2 = st.columns(2)
-    if col1.button("通过并提取测试点", type="primary"):
-        try:
-            graph.update_state(
-                config,
-                {"requirement_analysis": st.session_state.requirement_editor_text.strip()},
-            )
-            _run_with_progress("正在提取测试点", lambda: graph.invoke(None, config))
-            next_values = _get_state_values(graph, config)
-            st.session_state.test_points_table = _test_points_to_table_rows(
-                next_values.get("test_points", [])
-            )
-            st.session_state.phase = PHASE_TEST_POINTS
-            st.rerun()
-        except Exception as exc:
-            st.error(f"提取测试点失败：{exc}")
-
-    if col2.button("重新生成需求分析"):
-        try:
-            _rerun_current_phase(graph, llm, PHASE_REQUIREMENT)
-            st.rerun()
-        except Exception as exc:
-            st.error(f"重新生成失败：{exc}")
+    _render_phase_actions(
+        graph=graph,
+        llm=llm,
+        config=config,
+        current_phase=PHASE_REQUIREMENT,
+        advance_label="通过并提取测试点",
+        advance_prompt="正在提取测试点",
+        advance_payload={
+            "requirement_analysis": st.session_state.requirement_editor_text.strip()
+        },
+        advance_error_prefix="提取测试点失败",
+    )
 
     _render_retrieval_evidence(values, "analyze_requirement", "本阶段依据片段")
 
@@ -765,7 +796,9 @@ def _render_test_points_page(graph: Any, llm: ChatOpenAI) -> None:
     values = _get_state_values(graph, config)
 
     if not st.session_state.test_points_table:
-        st.session_state.test_points_table = _test_points_to_table_rows(values.get("test_points", []))
+        st.session_state.test_points_table = _test_points_to_table_rows(
+            values.get("test_points", [])
+        )
 
     st.caption("AI 生成测试点")
     edited_data = st.data_editor(
@@ -775,37 +808,27 @@ def _render_test_points_page(graph: Any, llm: ChatOpenAI) -> None:
         column_config={
             "name": st.column_config.TextColumn("测试点", required=True),
             "test_type": st.column_config.SelectboxColumn(
-                "类型", options=["功能", "性能", "安全", "兼容性"], required=True
+                "类型", options=TEST_TYPE_OPTIONS, required=True
             ),
             "priority": st.column_config.SelectboxColumn(
-                "优先级", options=["P0", "P1", "P2", "P3"], required=True
+                "优先级", options=PRIORITY_OPTIONS, required=True
             ),
         },
     )
 
-    col1, col2 = st.columns(2)
-    if col1.button("通过并生成测试大纲", type="primary"):
-        try:
-            test_points_rows = _editor_data_to_rows(edited_data)
-            test_points = _normalize_test_points_rows(test_points_rows)
-            if not test_points:
-                raise ValueError("至少保留一个有效测试点。")
-
-            graph.update_state(config, {"test_points": test_points})
-            _run_with_progress("正在生成测试大纲", lambda: graph.invoke(None, config))
-            next_values = _get_state_values(graph, config)
-            st.session_state.outline_table = _outline_to_table_rows(next_values.get("test_outline", []))
-            st.session_state.phase = PHASE_OUTLINE
-            st.rerun()
-        except Exception as exc:
-            st.error(f"生成测试大纲失败：{exc}")
-
-    if col2.button("重新生成测试点"):
-        try:
-            _rerun_current_phase(graph, llm, PHASE_TEST_POINTS)
-            st.rerun()
-        except Exception as exc:
-            st.error(f"重新生成失败：{exc}")
+    test_points = _normalize_test_points_rows(_editor_data_to_rows(edited_data))
+    _render_phase_actions(
+        graph=graph,
+        llm=llm,
+        config=config,
+        current_phase=PHASE_TEST_POINTS,
+        advance_label="通过并生成测试大纲",
+        advance_prompt="正在生成测试大纲",
+        advance_payload={"test_points": test_points},
+        advance_error_prefix="生成测试大纲失败",
+        require_message="至少保留一个有效测试点。",
+        require_ok=bool(test_points),
+    )
 
     _render_retrieval_evidence(values, "extract_test_points", "本阶段依据片段")
 
@@ -816,7 +839,9 @@ def _render_outline_page(graph: Any, llm: ChatOpenAI) -> None:
     values = _get_state_values(graph, config)
 
     if not st.session_state.outline_table:
-        st.session_state.outline_table = _outline_to_table_rows(values.get("test_outline", []))
+        st.session_state.outline_table = _outline_to_table_rows(
+            values.get("test_outline", [])
+        )
 
     st.caption("AI 生成测试大纲")
     edited_data = st.data_editor(
@@ -827,39 +852,27 @@ def _render_outline_page(graph: Any, llm: ChatOpenAI) -> None:
             "module_name": st.column_config.TextColumn("模块", required=True),
             "name": st.column_config.TextColumn("测试点", required=True),
             "test_type": st.column_config.SelectboxColumn(
-                "类型", options=["功能", "性能", "安全", "兼容性"], required=True
+                "类型", options=TEST_TYPE_OPTIONS, required=True
             ),
             "priority": st.column_config.SelectboxColumn(
-                "优先级", options=["P0", "P1", "P2", "P3"], required=True
+                "优先级", options=PRIORITY_OPTIONS, required=True
             ),
         },
     )
 
-    col1, col2 = st.columns(2)
-    if col1.button("通过并生成测试用例", type="primary"):
-        try:
-            outline_rows = _editor_data_to_rows(edited_data)
-            modified_outline = _normalize_outline_rows(outline_rows)
-            if not modified_outline:
-                raise ValueError("至少保留一个有效模块与测试点。")
-
-            graph.update_state(config, {"modified_outline": modified_outline})
-            _run_with_progress("正在生成测试用例", lambda: graph.invoke(None, config))
-            next_values = _get_state_values(graph, config)
-            st.session_state.test_cases_table = _cases_to_table_rows(
-                next_values.get("test_cases", [])
-            )
-            st.session_state.phase = PHASE_CASE
-            st.rerun()
-        except Exception as exc:
-            st.error(f"生成测试用例失败：{exc}")
-
-    if col2.button("重新生成测试大纲"):
-        try:
-            _rerun_current_phase(graph, llm, PHASE_OUTLINE)
-            st.rerun()
-        except Exception as exc:
-            st.error(f"重新生成失败：{exc}")
+    modified_outline = _normalize_outline_rows(_editor_data_to_rows(edited_data))
+    _render_phase_actions(
+        graph=graph,
+        llm=llm,
+        config=config,
+        current_phase=PHASE_OUTLINE,
+        advance_label="通过并生成测试用例",
+        advance_prompt="正在生成测试用例",
+        advance_payload={"modified_outline": modified_outline},
+        advance_error_prefix="生成测试用例失败",
+        require_message="至少保留一个有效模块与测试点。",
+        require_ok=bool(modified_outline),
+    )
 
     _render_retrieval_evidence(values, "generate_outline", "本阶段依据片段")
 
@@ -875,38 +888,33 @@ def _render_case_page(graph: Any, llm: ChatOpenAI) -> None:
         num_rows="dynamic",
     )
 
-    col1, col2 = st.columns(2)
-    if col1.button("通过并导出 Excel", type="primary"):
-        try:
-            config = _build_config(llm)
-            case_rows = _editor_data_to_rows(edited_data)
-            modified_cases = _normalize_cases(case_rows)
-            graph.update_state(config, {"modified_test_cases": modified_cases})
-
-            final_state = _run_with_progress("正在导出 Excel", lambda: graph.invoke(None, config))
-
-            excel_path = ""
-            if isinstance(final_state, dict):
-                excel_path = str(final_state.get("excel_output_path", ""))
-            if not excel_path:
-                values = _get_state_values(graph, config)
-                excel_path = str(values.get("excel_output_path", ""))
-
-            st.session_state.excel_output_path = excel_path
-            st.session_state.phase = PHASE_DOWNLOAD
-            st.rerun()
-        except Exception as exc:
-            st.error(f"导出失败：{exc}")
-
-    if col2.button("重新生成测试用例"):
-        try:
-            _rerun_current_phase(graph, llm, PHASE_CASE)
-            st.rerun()
-        except Exception as exc:
-            st.error(f"重新生成失败：{exc}")
+    modified_cases = _normalize_cases(_editor_data_to_rows(edited_data))
+    _render_phase_actions(
+        graph=graph,
+        llm=llm,
+        config=config,
+        current_phase=PHASE_CASE,
+        advance_label=f"通过并导出 {st.session_state.export_format.upper()}",
+        advance_prompt="正在导出文件",
+        advance_payload={"modified_test_cases": modified_cases},
+        advance_error_prefix="导出失败",
+        require_message="至少保留一条有效测试用例。",
+        require_ok=bool(modified_cases),
+        after_advance=_capture_export_path,
+    )
 
     _render_retrieval_evidence(values, "generate_cases_requirement", "需求依据片段")
     _render_retrieval_evidence(values, "generate_cases_testcase", "历史用例参考片段")
+
+
+def _capture_export_path(graph: Any, config: dict[str, Any], final_state: Any) -> None:
+    """导出节点返回的路径可能只在 final_state 里，也可能只落到了图上。"""
+    export_path = ""
+    if isinstance(final_state, dict):
+        export_path = str(final_state.get("excel_output_path", ""))
+    if not export_path:
+        export_path = str(_get_state_values(graph, config).get("excel_output_path", ""))
+    st.session_state.excel_output_path = export_path
 
 
 # 导出格式 -> 下载时的 MIME 类型。
@@ -993,21 +1001,35 @@ def main() -> None:
     _render_phase_nav(phase)
     st.divider()
 
-    if phase == PHASE_UPLOAD:
-        _render_upload_page(graph, llm)
-    elif phase == PHASE_REQUIREMENT:
-        _render_requirement_page(graph, llm)
-    elif phase == PHASE_TEST_POINTS:
-        _render_test_points_page(graph, llm)
-    elif phase == PHASE_OUTLINE:
-        _render_outline_page(graph, llm)
-    elif phase == PHASE_CASE:
-        _render_case_page(graph, llm)
-    elif phase == PHASE_DOWNLOAD:
-        _render_download_page()
-    else:
+    # 阶段 -> 渲染函数的映射表。新增阶段时只需在这里加一行，
+    # 不再需要维护一条 if-elif 链。
+    renderer = _PHASE_RENDERERS.get(phase)
+    if renderer is None:
         _reset_flow()
         st.rerun()
+        return
+
+    renderer(graph, llm)
+
+
+def _render_upload(view_graph: Any, view_llm: ChatOpenAI) -> None:
+    _render_upload_page(view_graph, view_llm)
+
+
+def _render_download(view_graph: Any, view_llm: ChatOpenAI) -> None:
+    _ = view_graph, view_llm
+    _render_download_page()
+
+
+# 渲染函数签名统一为 (graph, llm)，便于按表分发。
+_PHASE_RENDERERS: dict[str, Callable[[Any, ChatOpenAI], None]] = {
+    PHASE_UPLOAD: _render_upload,
+    PHASE_REQUIREMENT: _render_requirement_page,
+    PHASE_TEST_POINTS: _render_test_points_page,
+    PHASE_OUTLINE: _render_outline_page,
+    PHASE_CASE: _render_case_page,
+    PHASE_DOWNLOAD: _render_download,
+}
 
 
 if __name__ == "__main__":

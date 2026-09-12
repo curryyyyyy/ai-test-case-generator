@@ -10,6 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from rag.ingest import index_testcase_knowledge_file
+from utils.document_parser import supported_suffixes
 
 
 def _load_mapping(mapping_path: Path) -> dict[str, dict[str, str]]:
@@ -44,12 +45,15 @@ def main() -> None:
         raise FileNotFoundError(f"目录不存在: {root}")
 
     mapping = _load_mapping(Path(args.mapping).resolve()) if args.mapping else {}
+    # 后缀白名单来自解析器注册表，新增格式后批量入库自动支持。
+    patterns = [f"*{suffix}" for suffix in supported_suffixes()]
     files = sorted(
-        [*root.rglob("*.md"), *root.rglob("*.docx")],
+        [path for pattern in patterns for path in root.rglob(pattern)],
         key=lambda p: str(p).lower(),
     )
     if not files:
-        print("未发现 md/docx 文件。")
+        allowed = " / ".join(suffix.lstrip(".") for suffix in supported_suffixes())
+        print(f"未发现 {allowed} 文件。")
         return
 
     total_chunks = 0

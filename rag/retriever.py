@@ -1,11 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
-import math
-import re
 import threading
-import time
 from typing import Any
 
 from rag.config import (
@@ -17,21 +13,17 @@ from rag.config import (
     MULTI_QUERY_ENABLED,
     PER_QUERY_TOP_K,
     QUERY_COUNT,
-    RRF_K,
     RERANK_CANDIDATE_POOL,
-    RERANK_CROSS_ENCODER_LOCAL_FILES_ONLY,
-    RERANK_CROSS_ENCODER_MODEL,
     RERANK_FINAL_TOP_N,
     RERANK_MODE,
-    RERANK_TIMEOUT_MS,
     RETRIEVER_TOP_K,
     SEARCH_TYPE,
 )
-from rag.query_expander import expand_query
-from rag.reranker import rerank
 from rag.schemas import Citation, RetrievedChunk
-from rag.store import get_vector_store
-from rag.text_utils import tokenize
+
+
+# 策略实现在 rag/strategy_defaults 中注册；此处 import 触发注册（必须保留）。
+from rag import strategy_defaults as _strategy_defaults  # noqa: F401
 
 
 @dataclass
@@ -65,7 +57,7 @@ def _build_where_filter(
     return where_filter
 
 
-def _build_chunk(
+def build_chunk(
     doc: Any,
     score: float,
     query_text: str,
@@ -85,250 +77,20 @@ def _build_chunk(
     )
 
 
-def _vector_search_once(
-    query_text: str,
-    doc_id: str,
-    doc_type: str,
-    k: int,
-    extra_filter: dict[str, str] | None = None,
-) -> list[RetrievedChunk]:
-    vector_store = get_vector_store()
-    raw_results: list[tuple[Any, float]]
-    where_filter = _build_where_filter(
-        doc_id=doc_id,
-        doc_type=doc_type,
-        extra_filter=extra_filter,
-    )
-
-    if SEARCH_TYPE == "mmr":
-        docs = vector_store.max_marginal_relevance_search(
-            query=query_text,
-            k=k,
-            fetch_k=FETCH_K,
-            filter=where_filter,
-        )
-        raw_results = [(doc, 0.0) for doc in docs]
-    else:
-        raw_results = vector_store.similarity_search_with_relevance_scores(
-            query=query_text,
-            k=k,
-            filter=where_filter,
-        )
-
-    results: list[RetrievedChunk] = []
-    for doc, score in raw_results:
-        results.append(_build_chunk(doc, score, query_text, doc_id, doc_type))
-    return results
+# 兼容旧引用（策略实现内部统一用 build_chunk）。
+_build_chunk = build_chunk
 
 
-# 分词统一收敛到 rag.text_utils，BM25 与 Rerank 共用同一实现，
-# 避免两处逻辑漂移（此前正是两份相同实现带着同一个中文缺陷）。
-_tokenize_for_bm25 = tokenize
-
-
-BM25_K1 = 1.5
-BM25_B = 0.75
-# BM25 索引缓存有效期（秒）。语料发生写入时会由 ingest 主动失效，
-# TTL 只作为兜底，防止极端情况下长期命中过期索引。
-BM25_CACHE_TTL_SECONDS = 300.0
-
-
-@dataclass
-class _BM25Document:
-    """供 _build_chunk 消费的轻量文档对象。"""
-
-    page_content: str
-    metadata: dict[str, Any]
-
-
-@dataclass
-class _BM25Index:
-    documents: list[str]
-    metadatas: list[dict[str, Any]]
-    doc_lengths: list[int]
-    avg_doc_len: float
-    # 倒排索引：term -> [(doc_index, term_freq)]
-    postings: dict[str, list[tuple[int, int]]]
-    doc_freq: dict[str, int]
-    created_at: float
-
-
-# 缓存键为过滤条件，不同 doc_id / doc_type / 额外过滤各自持有独立索引。
-_BM25_CACHE: dict[str, _BM25Index] = {}
+# BM25 实现已迁至 rag/strategy_defaults.BM25Searcher。
+# 缓存失效入口保留在此：rag/ingest.py 在语料写入后调用它。
 _BM25_CACHE_LOCK = threading.Lock()
 
 
 def invalidate_bm25_cache() -> None:
     """语料写入后调用，避免检索命中过期索引。"""
-    with _BM25_CACHE_LOCK:
-        _BM25_CACHE.clear()
+    from rag.strategy_defaults import DEFAULT_BM25_SEARCHER
 
-
-def _build_bm25_index(
-    documents: list[str],
-    metadatas: list[dict[str, Any]],
-) -> _BM25Index | None:
-    tokenized_docs = [_tokenize_for_bm25(str(text)) for text in documents]
-    doc_lengths = [len(tokens) for tokens in tokenized_docs]
-    doc_count = len(doc_lengths)
-    if doc_count == 0:
-        return None
-
-    total_len = sum(doc_lengths)
-    if total_len <= 0:
-        return None
-
-    postings: dict[str, list[tuple[int, int]]] = {}
-    for doc_index, tokens in enumerate(tokenized_docs):
-        term_freq: dict[str, int] = {}
-        for token in tokens:
-            term_freq[token] = term_freq.get(token, 0) + 1
-        for token, freq in term_freq.items():
-            postings.setdefault(token, []).append((doc_index, freq))
-
-    return _BM25Index(
-        documents=list(documents),
-        metadatas=list(metadatas),
-        doc_lengths=doc_lengths,
-        avg_doc_len=total_len / doc_count,
-        postings=postings,
-        doc_freq={term: len(items) for term, items in postings.items()},
-        created_at=time.time(),
-    )
-
-
-def _get_bm25_index(where_filter: dict[str, Any]) -> _BM25Index | None:
-    """获取（必要时构建）BM25 索引。
-
-    原实现每次查询都全量拉语料并重新分词，一次完整流水线会触发约 30 次
-    全库扫描；这里改为复用缓存索引，仅对命中的倒排表打分。
-    """
-    cache_key = json.dumps(where_filter, sort_keys=True, default=str)
-    now = time.time()
-
-    with _BM25_CACHE_LOCK:
-        cached = _BM25_CACHE.get(cache_key)
-        if cached is not None and now - cached.created_at < BM25_CACHE_TTL_SECONDS:
-            return cached
-
-    # 构建索引是重活，刻意不持锁，避免阻塞并发查询。
-    vector_store = get_vector_store()
-    payload = vector_store.get(
-        where=where_filter,
-        include=["documents", "metadatas"],
-    )
-    documents = payload.get("documents", []) or []
-    metadatas = payload.get("metadatas", []) or []
-    if not documents or not metadatas:
-        with _BM25_CACHE_LOCK:
-            _BM25_CACHE.pop(cache_key, None)
-        return None
-
-    index = _build_bm25_index(documents, metadatas)
-    with _BM25_CACHE_LOCK:
-        if index is None:
-            _BM25_CACHE.pop(cache_key, None)
-        else:
-            _BM25_CACHE[cache_key] = index
-    return index
-
-
-def _score_bm25_index(
-    index: _BM25Index,
-    query_terms: list[str],
-) -> dict[int, float]:
-    doc_count = len(index.doc_lengths)
-    scores: dict[int, float] = {}
-    for term in query_terms:
-        items = index.postings.get(term)
-        if not items:
-            continue
-        df = index.doc_freq.get(term, 0)
-        idf = math.log(1 + (doc_count - df + 0.5) / (df + 0.5))
-        for doc_index, freq in items:
-            doc_len = index.doc_lengths[doc_index]
-            numerator = freq * (BM25_K1 + 1)
-            denominator = freq + BM25_K1 * (
-                1 - BM25_B + BM25_B * doc_len / index.avg_doc_len
-            )
-            scores[doc_index] = scores.get(doc_index, 0.0) + idf * numerator / denominator
-    return scores
-
-
-def _bm25_search_once(
-    query_text: str,
-    doc_id: str,
-    doc_type: str,
-    k: int,
-    extra_filter: dict[str, str] | None = None,
-) -> list[RetrievedChunk]:
-    query_terms = _tokenize_for_bm25(query_text)
-    if not query_terms:
-        return []
-
-    where_filter = _build_where_filter(
-        doc_id=doc_id,
-        doc_type=doc_type,
-        extra_filter=extra_filter,
-    )
-    index = _get_bm25_index(where_filter)
-    if index is None:
-        return []
-
-    scores = _score_bm25_index(index, query_terms)
-    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-
-    results: list[RetrievedChunk] = []
-    for doc_index, score in ranked[:k]:
-        if score <= 0:
-            continue
-        doc = _BM25Document(
-            page_content=str(index.documents[doc_index]),
-            metadata=index.metadatas[doc_index] or {},
-        )
-        results.append(_build_chunk(doc, score, query_text, doc_id, doc_type))
-    return results
-
-
-def _fuse_ranked_results(
-    vector_results: list[RetrievedChunk],
-    bm25_results: list[RetrievedChunk],
-    query_text: str,
-    doc_id: str,
-    doc_type: str,
-    k: int,
-) -> list[RetrievedChunk]:
-    fused_scores: dict[str, float] = {}
-    chunks: dict[str, RetrievedChunk] = {}
-    for rank, chunk in enumerate(vector_results, start=1):
-        fused_scores[chunk.chunk_id] = fused_scores.get(chunk.chunk_id, 0.0) + 1.0 / (RRF_K + rank)
-        chunks[chunk.chunk_id] = chunk
-    for rank, chunk in enumerate(bm25_results, start=1):
-        fused_scores[chunk.chunk_id] = fused_scores.get(chunk.chunk_id, 0.0) + 1.0 / (RRF_K + rank)
-        if chunk.chunk_id not in chunks:
-            chunks[chunk.chunk_id] = chunk
-
-    ranked = sorted(
-        fused_scores.items(),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-    results: list[RetrievedChunk] = []
-    for chunk_id, score in ranked[:k]:
-        chunk = chunks[chunk_id]
-        results.append(
-            RetrievedChunk(
-                chunk_id=chunk.chunk_id,
-                doc_id=chunk.doc_id or doc_id,
-                doc_type=chunk.doc_type or doc_type,
-                source_name=chunk.source_name,
-                section_path=chunk.section_path,
-                text=chunk.text,
-                score=float(score),
-                query=query_text,
-            )
-        )
-    return results
+    DEFAULT_BM25_SEARCHER.invalidate()
 
 
 def _search_once(
@@ -337,44 +99,72 @@ def _search_once(
     doc_type: str,
     k: int,
     extra_filter: dict[str, str] | None = None,
+    vector_strategy: str | None = None,
+    sparse_strategy: str | None = None,
+    fusion_strategy: str | None = None,
 ) -> list[RetrievedChunk]:
-    vector_results = _vector_search_once(
+    """单条 query 的召回：向量 + 稀疏，命中多路时用融合策略合并。"""
+    where_filter = _build_where_filter(
+        doc_id=doc_id,
+        doc_type=doc_type,
+        extra_filter=extra_filter,
+    )
+
+    vector_searcher = _resolve_strategy(
+        "vector",
+        vector_strategy,
+        search_type=SEARCH_TYPE,
+        fetch_k=FETCH_K,
+    )
+    vector_results = vector_searcher.search(
         query_text=query_text,
         doc_id=doc_id,
         doc_type=doc_type,
         k=k,
-        extra_filter=extra_filter,
+        where_filter=where_filter,
     )
     if not HYBRID_SEARCH_ENABLED:
         return vector_results
 
-    bm25_results = _bm25_search_once(
+    sparse_searcher = _resolve_strategy("bm25", sparse_strategy)
+    sparse_results = sparse_searcher.search(
         query_text=query_text,
         doc_id=doc_id,
         doc_type=doc_type,
         k=max(k, BM25_TOP_K),
-        extra_filter=extra_filter,
+        where_filter=where_filter,
     )
-    if not bm25_results:
+    if not sparse_results:
         return vector_results
 
-    return _fuse_ranked_results(
-        vector_results=vector_results,
-        bm25_results=bm25_results,
+    fuser = _resolve_strategy("fusion", fusion_strategy)
+    return fuser.fuse(
+        result_sets=[vector_results, sparse_results],
         query_text=query_text,
         doc_id=doc_id,
         doc_type=doc_type,
         k=max(k, BM25_TOP_K),
     )
+
+
+def _resolve_strategy(kind: str, name: str | None, **kwargs: Any) -> Any:
+    """按名字取策略；未指定时用注册表里的默认实现。
+
+    策略可替换是这一步重构的核心：换 query 扩展器、换向量库、换融合算法，
+    都只需要注册新实现并在这里传名字，检索主流程不用改动。
+    """
+    from rag import strategy_registry
+
+    if name is None:
+        available = strategy_registry.available(kind)
+        if not available:
+            raise ValueError(f"未注册任何 {kind} 策略")
+        name = available[0]
+    return strategy_registry.get(kind, name, **kwargs)
 
 
 def _dedup_keep_best(chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
-    best: dict[str, RetrievedChunk] = {}
-    for chunk in chunks:
-        existing = best.get(chunk.chunk_id)
-        if existing is None or chunk.score > existing.score:
-            best[chunk.chunk_id] = chunk
-    return sorted(best.values(), key=lambda item: item.score, reverse=True)
+    return _resolve_strategy("dedup", None).dedup(chunks)
 
 
 def retrieve_context_with_meta(
@@ -386,6 +176,11 @@ def retrieve_context_with_meta(
     enable_rerank: bool | None = None,
     extra_filter: dict[str, str] | None = None,
     rerank_mode: str | None = None,
+    expander_strategy: str | None = None,
+    vector_strategy: str | None = None,
+    sparse_strategy: str | None = None,
+    fusion_strategy: str | None = None,
+    reranker_strategy: str | None = None,
 ) -> tuple[list[RetrievedChunk], RetrievalMeta]:
     # 运行时指定的 rerank 模式优先，未指定时回落到 rag/config.py 的常量。
     # 不能去改全局常量：Streamlit 是多会话共享进程，改常量会跨会话串扰。
@@ -413,7 +208,8 @@ def retrieve_context_with_meta(
     rerank_enabled = ENABLE_RERANK if enable_rerank is None else enable_rerank
 
     if mq_enabled:
-        expanded_queries = expand_query(query_text, max_queries=QUERY_COUNT)
+        expander = _resolve_strategy("expander", expander_strategy)
+        expanded_queries = expander.expand(query_text, max_queries=QUERY_COUNT)
     else:
         expanded_queries = [query_text]
 
@@ -427,6 +223,9 @@ def retrieve_context_with_meta(
                 doc_type=doc_type,
                 k=per_query_k,
                 extra_filter=extra_filter,
+                vector_strategy=vector_strategy,
+                sparse_strategy=sparse_strategy,
+                fusion_strategy=fusion_strategy,
             )
         )
 
@@ -435,17 +234,14 @@ def retrieve_context_with_meta(
     post_dedup_count = len(deduped)
 
     candidate_pool = deduped[:RERANK_CANDIDATE_POOL]
-    rerank_result = rerank(
+    rerank_strategy = _resolve_strategy("reranker", reranker_strategy)
+    selected, rerank_meta = rerank_strategy.rerank(
         query=query_text,
         candidates=candidate_pool,
+        top_n=min(RERANK_FINAL_TOP_N, final_top_k),
         enable_rerank=rerank_enabled,
         mode=effective_rerank_mode,
-        cross_encoder_model=RERANK_CROSS_ENCODER_MODEL,
-        cross_encoder_local_files_only=RERANK_CROSS_ENCODER_LOCAL_FILES_ONLY,
-        timeout_ms=RERANK_TIMEOUT_MS,
-        final_top_n=min(RERANK_FINAL_TOP_N, final_top_k),
     )
-    selected = rerank_result.items
 
     if not rerank_enabled:
         selected = deduped[:final_top_k]
@@ -456,13 +252,18 @@ def retrieve_context_with_meta(
         expanded_queries=expanded_queries,
         pre_dedup_count=pre_dedup_count,
         post_dedup_count=post_dedup_count,
-        rerank_mode=rerank_result.rerank_mode,
-        rerank_enabled=rerank_result.rerank_enabled,
-        rerank_latency_ms=rerank_result.rerank_latency_ms,
-        rerank_degraded=rerank_result.degraded,
-        rerank_degraded_reason=rerank_result.degraded_reason,
+        rerank_mode=rerank_meta["rerank_mode"],
+        rerank_enabled=rerank_meta["rerank_enabled"],
+        rerank_latency_ms=rerank_meta["rerank_latency_ms"],
+        rerank_degraded=rerank_meta["rerank_degraded"],
+        rerank_degraded_reason=rerank_meta["rerank_degraded_reason"],
     )
     return selected[:final_top_k], meta
+
+
+# 说明：原这里是直调 rag.reranker.rerank 的逻辑，现已改为 reranker 策略。
+# 若需要绕过策略，请向 strategy_registry 注册自定义 RerankStrategy，
+# 而不是在检索主流程里加分支。
 
 
 def retrieve_context(
@@ -489,6 +290,7 @@ def retrieve_testcase_context_with_meta(
     test_type: str = "",
     priority: str = "",
     rerank_mode: str | None = None,
+    reranker_strategy: str | None = None,
 ) -> tuple[list[RetrievedChunk], RetrievalMeta]:
     extra_filter: dict[str, str] = {}
     if module:
@@ -506,6 +308,7 @@ def retrieve_testcase_context_with_meta(
         enable_rerank=enable_rerank,
         extra_filter=extra_filter if extra_filter else None,
         rerank_mode=rerank_mode,
+        reranker_strategy=reranker_strategy,
     )
 
 

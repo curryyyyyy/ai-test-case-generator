@@ -11,8 +11,7 @@ from rag.config import CHUNK_OVERLAP, CHUNK_SIZE
 from rag.retriever import invalidate_bm25_cache
 from rag.schemas import Chunk
 from rag.store import get_vector_store
-from utils.document_parser.docx_parser import parse_docx
-from utils.document_parser.md_parser import parse_markdown
+from utils.document_parser import parse_file
 
 
 def _chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
@@ -235,13 +234,8 @@ def index_testcase_knowledge_file(
     if not path.exists():
         raise FileNotFoundError(f"未找到文件: {path}")
 
-    suffix = path.suffix.lower()
-    if suffix == ".md":
-        structured_doc = parse_markdown(path.read_text(encoding="utf-8")).to_dict()
-    elif suffix == ".docx":
-        structured_doc = parse_docx(path).to_dict()
-    else:
-        raise ValueError(f"仅支持 .md/.docx，当前文件: {path}")
+    # 格式分派统一走解析器注册表，新增格式后这里无需改动。
+    structured_doc = parse_file(path).to_dict()
 
     doc_id = f"testcase_{path.stem}_{uuid.uuid4().hex[:8]}"
     return index_document(
